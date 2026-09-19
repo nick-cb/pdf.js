@@ -1,0 +1,109 @@
+name: Publish pdfjs-dist branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Immutable tag to create for the distribution commit
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-pdfjs-dist
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish pdfjs-dist
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag
+        env:
+          DIST_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "$DIST_TAG" =~ ^pdfjs-dist-[0-9A-Za-z._-]+$ ]]; then
+            echo "Tag must start with pdfjs-dist- and contain only letters, numbers, dots, underscores, and hyphens." >&2
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/$DIST_TAG"; then
+            echo "Tag $DIST_TAG already exists. Distribution tags must never move." >&2
+            exit 1
+          fi
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.15.0
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build pdfjs-dist
+        run: npx gulp dist
+
+      - name: Validate package contents
+        run: |
+          required_paths=(
+            build/dist/package.json
+            build/dist/build/pdf.mjs
+            build/dist/build/pdf.worker.mjs
+            build/dist/types/src/pdf.d.ts
+            build/dist/standard_fonts
+            build/dist/wasm/libjpeg.wasm
+            build/dist/wasm/libjpeg_nowasm_fallback.js
+          )
+          for path in "${required_paths[@]}"; do
+            if [[ ! -e "$path" ]]; then
+              echo "Missing required distribution path: $path" >&2
+              exit 1
+            fi
+          done
+
+      - name: Verify packed package import
+        run: |
+          package_dir="$RUNNER_TEMP/package"
+          install_dir="$RUNNER_TEMP/install"
+          mkdir -p "$package_dir" "$install_dir"
+          package_file=$(npm pack ./build/dist --pack-destination "$package_dir" --json | node -e \
+            "let json = ''; process.stdin.on('data', chunk => json += chunk); process.stdin.on('end', () => console.log(JSON.parse(json)[0].filename));")
+          cd "$install_dir"
+          npm init --yes
+          npm install "$package_dir/$package_file"
+          node --input-type=module -e \
+            "const resolved = import.meta.resolve('pdfjs-dist'); if (!resolved.endsWith('/build/pdf.mjs')) throw new Error('Unexpected entry point: ' + resolved); await import('pdfjs-dist');"
+
+      - name: Publish distribution branch and tag
+        env:
+          DIST_TAG: ${{ inputs.tag }}
+        run: |
+          source_sha=$(git rev-parse HEAD)
+          dist_dir="$RUNNER_TEMP/dist"
+          mkdir -p "$dist_dir"
+          cp -a build/dist/. "$dist_dir/"
+
+          if git ls-remote --exit-code --heads origin dist >/dev/null 2>&1; then
+            git fetch origin dist
+            git switch --detach origin/dist
+          else
+            git switch --orphan dist
+          fi
+
+          git rm -rf --ignore-unmatch .
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a "$dist_dir/." .
+          git add --all
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m "Build pdfjs-dist from $source_sha"
+          git tag "$DIST_TAG"
+          git push origin HEAD:dist "refs/tags/$DIST_TAG"
