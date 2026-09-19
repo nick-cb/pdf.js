@@ -144,6 +144,7 @@ Located in `external/`:
 - **bcmaps**: Binary CMaps for CJK fonts
 - **standard_fonts**: Core 14 PDF fonts metrics
 - **cmapscompress**: Tools for compressing CMaps
+- **libjpeg**: JPEG decoder (WASM); see `external/libjpeg/README.md`
 - **openjpeg**: JPEG2000 decoder (WASM)
 - **quickjs**: JavaScript engine for sandboxed execution
 

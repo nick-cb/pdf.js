@@ -156,6 +156,10 @@ const RENDERING_CANCELLED_TIMEOUT = 100; // ms
  * @property {boolean} [useWasm] - Attempt to use WebAssembly in order to
  *    improve e.g. image decoding performance.
  *    The default value is `true`.
+ * @property {boolean} [profileImages] - Log a structured profile of every
+ *    decoded image -- the backends considered, why the preferred ones were
+ *    skipped, and where the time went -- at the `info` verbosity level.
+ *    The default value is `false`.
  * @property {boolean} [stopAtErrors] - Reject certain promises, e.g.
  *   `getOperatorList`, `getTextContent`, and `RenderTask`, when the associated
  *   PDF data cannot be successfully parsed, instead of attempting to recover
@@ -304,6 +308,7 @@ function getDocument(src = {}) {
   // worker bootstrap; the resolved boolean is forwarded to the worker.
   const gpuPromise = enableWebGPU ? initGPU() : Promise.resolve(false);
   const useWasm = src.useWasm !== false;
+  const profileImages = src.profileImages === true;
   const pagesMapper = src.pagesMapper || new PagesMapper();
 
   // Parameters whose default values depend on other parameters.
@@ -377,6 +382,7 @@ function getDocument(src = {}) {
       isImageDecoderSupported,
       canvasMaxAreaInBytes,
       fontExtraProperties,
+      profileImages,
       useSystemFonts,
       useWasm,
       useWorkerFetch,

@@ -5,6 +5,9 @@ node_modules/
 external/bcmaps/
 external/builder/fixtures/
 external/builder/fixtures_babel/
+external/libjpeg/libjpeg.js
+external/libjpeg/libjpeg_nowasm_fallback.js
+external/libjpeg/.build/
 external/openjpeg/
 external/qcms/
 external/quickjs/

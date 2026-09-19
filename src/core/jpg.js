@@ -18,6 +18,34 @@ import { ColorSpaceUtils } from "./colorspace_utils.js";
 import { DeviceCmykCS } from "./colorspace.js";
 import { grayToRGBA } from "../shared/image_utils.js";
 
+/**
+ * Converts CMYK samples to RGB in place, returning a view of the same buffer.
+ * @param {Uint8ClampedArray} data
+ * @returns {Uint8ClampedArray}
+ */
+function convertCmykToRgb(data) {
+  const count = data.length / 4;
+  ColorSpaceUtils.cmyk.getRgbBuffer(data, 0, count, data, 0, 8, 0);
+  return data.subarray(0, count * 3);
+}
+
+/**
+ * Converts CMYK samples to RGBA in place, returning the same buffer.
+ * @param {Uint8ClampedArray} data
+ * @returns {Uint8ClampedArray}
+ */
+function convertCmykToRgba(data) {
+  ColorSpaceUtils.cmyk.getRgbBuffer(data, 0, data.length / 4, data, 0, 8, 1);
+
+  if (ColorSpaceUtils.cmyk instanceof DeviceCmykCS) {
+    // The alpha-component isn't updated by `DeviceCmykCS`, doing it manually.
+    for (let i = 3, ii = data.length; i < ii; i += 4) {
+      data[i] = 255;
+    }
+  }
+  return data;
+}
+
 class JpegError extends BaseException {
   constructor(msg) {
     super(msg, "JpegError");
@@ -1372,21 +1400,11 @@ class JpegImage {
   }
 
   _convertCmykToRgb(data) {
-    const count = data.length / 4;
-    ColorSpaceUtils.cmyk.getRgbBuffer(data, 0, count, data, 0, 8, 0);
-    return data.subarray(0, count * 3);
+    return convertCmykToRgb(data);
   }
 
   _convertCmykToRgba(data) {
-    ColorSpaceUtils.cmyk.getRgbBuffer(data, 0, data.length / 4, data, 0, 8, 1);
-
-    if (ColorSpaceUtils.cmyk instanceof DeviceCmykCS) {
-      // The alpha-component isn't updated by `DeviceCmykCS`, doing it manually.
-      for (let i = 3, ii = data.length; i < ii; i += 4) {
-        data[i] = 255;
-      }
-    }
-    return data;
+    return convertCmykToRgba(data);
   }
 
   getData({ width, height, forceRGBA = false, forceRGB = false }) {
@@ -1438,4 +1456,4 @@ class JpegImage {
   }
 }
 
-export { JpegError, JpegImage };
+export { convertCmykToRgb, convertCmykToRgba, JpegError, JpegImage };

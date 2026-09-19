@@ -247,5 +247,127 @@ describe("jpeg_stream", function () {
       ).toBeNull();
       expect(decoderInits.length).toEqual(0);
     });
+
+    it("should report why `ImageDecoder` was skipped", async function () {
+      const data = createJpeg({ width: 40000, height: 4000, numComponents: 4 });
+      const stream = createStream(data);
+      await stream.getTransferableImage(40000, 4000);
+
+      expect(stream.backendInfo).toEqual({
+        backend: null,
+        skipped: [{ backend: "ImageDecoder", reason: "component layout" }],
+      });
+
+      const fits = createStream(createJpeg({ width: 1024, height: 1024 }));
+      await fits.getTransferableImage(1024, 1024);
+
+      expect(fits.backendInfo).toEqual({
+        backend: "ImageDecoder",
+        skipped: [],
+      });
+    });
+  });
+
+  describe("decodeImage", function () {
+    // 16x16 grayscale and RGB baseline JPEGs.
+    const TINY_GRAY =
+      "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABALDA4MChAODQ4SERATGCgaGBYWGDEjJR0oOjM9" +
+      "PDkzODdASFxOQERXRTc4UG1RV19iZ2hnPk1xeXBkeFxlZ2P/wAALCAAQABABAREA/8QAFgAB" +
+      "AQEAAAAAAAAAAAAAAAAAAAYH/8QAFhAAAwAAAAAAAAAAAAAAAAAAABVi/9oACAEBAAA/AJ1L" +
+      "ISyaIlkJZP/Z";
+    const TINY_RGB =
+      "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABALDA4MChAODQ4SERATGCgaGBYWGDEjJR0oOjM9" +
+      "PDkzODdASFxOQERXRTc4UG1RV19iZ2hnPk1xeXBkeFxlZ2P/2wBDARESEhgVGC8aGi9jQjhC" +
+      "Y2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2P/wAAR" +
+      "CAAQABADASIAAhEBAxEB/8QAFgABAQEAAAAAAAAAAAAAAAAAAAQF/8QAFRABAQAAAAAAAAAA" +
+      "AAAAAAAAABP/xAAUAQEAAAAAAAAAAAAAAAAAAAAF/8QAFhEAAwAAAAAAAAAAAAAAAAAAABVh" +
+      "/9oADAMBAAIRAxEAPwDAqVRVKlFEGWlP/9k=";
+
+    function createDecoded(base64, { forceRGBA, forceRGB, reducePower } = {}) {
+      const data = stringToBytes(atob(base64));
+      const stream = new JpegStream(
+        new Stream(data, 0, data.length, Dict.empty),
+        data.length,
+        null
+      );
+      stream.drawWidth = 16;
+      stream.drawHeight = 16;
+      stream.forceRGBA = !!forceRGBA;
+      stream.forceRGB = !!forceRGB;
+      stream.reducePower = reducePower ?? 0;
+      return stream;
+    }
+
+    beforeEach(function () {
+      // The Wasm decoder is exercised through the reference tests; here the
+      // point is that everything still works when it isn't used.
+      JpegStream.setOptions({
+        isImageDecoderSupported: false,
+        useWasm: false,
+      });
+    });
+
+    afterEach(function () {
+      JpegStream.setOptions({
+        isImageDecoderSupported: false,
+        useWasm: true,
+      });
+    });
+
+    it("should fall back to `JpegImage`, and say so", async function () {
+      const stream = createDecoded(TINY_GRAY);
+      const data = await stream.getImageData(0, null);
+
+      expect(data.length).toEqual(16 * 16);
+      expect(stream.decodedWidth).toEqual(16);
+      expect(stream.decodedHeight).toEqual(16);
+      expect(stream.backendInfo).toEqual({
+        backend: "JpegImage",
+        skipped: [{ backend: "JpegWasm", reason: "disabled" }],
+      });
+    });
+
+    it("should produce the requested pixel format", async function () {
+      const rgba = await createDecoded(TINY_GRAY, {
+        forceRGBA: true,
+      }).getImageData(0, null);
+      expect(rgba.length).toEqual(16 * 16 * 4);
+      expect(rgba[0]).toEqual(rgba[1]);
+      expect(rgba[1]).toEqual(rgba[2]);
+      expect(rgba[3]).toEqual(255);
+
+      const rgb = await createDecoded(TINY_RGB, {
+        forceRGB: true,
+      }).getImageData(0, null);
+      expect(rgb.length).toEqual(16 * 16 * 3);
+
+      const native = await createDecoded(TINY_RGB).getImageData(0, null);
+      expect(native.length).toEqual(16 * 16 * 3);
+    });
+
+    it("should not reduce on the JavaScript path", async function () {
+      // `JpegImage` has no reduced-resolution decoding, so the dimensions that
+      // come back are the ones the caller must use.
+      const stream = createDecoded(TINY_RGB, { reducePower: 2 });
+      const data = await stream.getImageData(0, null);
+
+      expect(stream.decodedWidth).toEqual(16);
+      expect(stream.decodedHeight).toEqual(16);
+      expect(data.length).toEqual(16 * 16 * 3);
+    });
+
+    it("should not use the Wasm decoder without dimensions", async function () {
+      JpegStream.setOptions({
+        isImageDecoderSupported: false,
+        useWasm: true,
+      });
+      const stream = createDecoded(TINY_GRAY);
+      stream.drawWidth = stream.drawHeight = undefined;
+      await stream.getImageData(0, null);
+
+      expect(stream.backendInfo.skipped).toEqual([
+        { backend: "JpegWasm", reason: "unknown dimensions" },
+      ]);
+    });
   });
 });

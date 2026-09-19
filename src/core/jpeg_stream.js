@@ -13,11 +13,12 @@
  * limitations under the License.
  */
 
+import { convertCmykToRgb, convertCmykToRgba, JpegImage } from "./jpg.js";
 import { FeatureTest, shadow, warn } from "../shared/util.js";
+import { JpegWasmFormat, JpegWasmImage } from "./jpeg_wasm.js";
 import { DecodeStream } from "./decode_stream.js";
 import { Dict } from "./primitives.js";
 import { ImageResizer } from "./image_resizer.js";
-import { JpegImage } from "./jpg.js";
 
 /**
  * For JPEG's we use a library to decode these images and the stream behaves
@@ -25,6 +26,24 @@ import { JpegImage } from "./jpg.js";
  */
 class JpegStream extends DecodeStream {
   static #isImageDecoderSupported = FeatureTest.isImageDecoderSupported;
+
+  static #useWasm = true;
+
+  /**
+   * The dimensions the last decode produced; they differ from
+   * `drawWidth`/`drawHeight` only after a reduced-resolution decode.
+   */
+  decodedWidth = 0;
+
+  decodedHeight = 0;
+
+  /** Which decoder produced `buffer`, and why the earlier ones were skipped. */
+  backendInfo = null;
+
+  /**
+   * Requests a `1 / 2 ** reducePower` decode; only the Wasm decoder honors it.
+   */
+  reducePower = 0;
 
   constructor(stream, maybeLength, params) {
     super(maybeLength);
@@ -45,8 +64,9 @@ class JpegStream extends DecodeStream {
     );
   }
 
-  static setOptions({ isImageDecoderSupported = false }) {
+  static setOptions({ isImageDecoderSupported = false, useWasm = true }) {
     this.#isImageDecoderSupported = isImageDecoderSupported;
+    this.#useWasm = useWasm;
   }
 
   get bytes() {
@@ -60,7 +80,13 @@ class JpegStream extends DecodeStream {
   }
 
   readBlock(decoderOptions) {
-    this.decodeImage(null, null, decoderOptions);
+    // The synchronous path always uses the JavaScript decoder; the Wasm one is
+    // only reachable through `getImageData`, which may await it.
+    this.#decodeWithJs(null, [], decoderOptions);
+  }
+
+  get isAsyncDecoder() {
+    return true;
   }
 
   get jpegOptions() {
@@ -90,7 +116,18 @@ class JpegStream extends DecodeStream {
     return data;
   }
 
-  decodeImage(bytes, _length, decoderOptions = null) {
+  #store(data, width, height, backend, skipped) {
+    this.buffer = data;
+    this.bufferLength = data.length;
+    this.decodedWidth = width;
+    this.decodedHeight = height;
+    this.backendInfo = { backend, skipped };
+    this.eof = true;
+
+    return this.buffer;
+  }
+
+  #decodeWithJs(bytes, skipped = [], decoderOptions = null) {
     if (this.eof) {
       return this.buffer;
     }
@@ -100,10 +137,6 @@ class JpegStream extends DecodeStream {
     try {
       bytes = this.#skipUselessBytes(bytes || this.bytes);
 
-      // TODO: if an image has a mask we need to combine the data.
-      // So ideally get a VideoFrame from getTransferableImage and then use
-      // copyTo.
-
       const jpegImage = new JpegImage(this.jpegOptions);
       jpegImage.parse(bytes);
       const data = jpegImage.getData({
@@ -112,12 +145,14 @@ class JpegStream extends DecodeStream {
         forceRGBA: this.forceRGBA,
         forceRGB: this.forceRGB,
       });
-      this.buffer = data;
-      this.bufferLength = data.length;
-      this.eof = true;
       succeeded = true;
-
-      return this.buffer;
+      return this.#store(
+        data,
+        this.drawWidth,
+        this.drawHeight,
+        "JpegImage",
+        skipped
+      );
     } finally {
       decoderOptions?.profile?.(
         succeeded
@@ -129,16 +164,114 @@ class JpegStream extends DecodeStream {
     }
   }
 
+  /**
+   * Decodes through libjpeg-turbo, asking it for the final pixel format -- and,
+   * when a reduction was requested, the final size -- so that no separate
+   * conversion or resampling pass is needed.
+   * @param {Uint8Array} bytes
+   * @returns {Promise<object>} `{ data, width, height }`, or `{ data: null,
+   *   reason }` when the image has to go through {@linkcode JpegImage}.
+   */
+  async #decodeWithWasm(bytes) {
+    const { colorTransform } = this.jpegOptions;
+    const wantsRgba = this.forceRGBA;
+    const wantsRgb = this.forceRGB;
+    const params = {
+      colorTransform: colorTransform ?? -1,
+      reducePower: this.reducePower,
+      // A frame that disagrees with the image dictionary needs the resampling
+      // that only `JpegImage` does.
+      expectedWidth: this.drawWidth,
+      expectedHeight: this.drawHeight,
+    };
+    const decoder = JpegWasmImage.instance;
+    let format = JpegWasmFormat.NATIVE;
+    if (wantsRgba) {
+      format = JpegWasmFormat.RGBA32;
+    } else if (wantsRgb) {
+      format = JpegWasmFormat.RGB24;
+    }
+
+    let result = await decoder.decode(bytes, {
+      ...params,
+      format,
+    });
+    if (!result.data && (wantsRgba || wantsRgb)) {
+      // CMYK is the one case libjpeg won't convert to RGB: PDF.js owns that
+      // conversion, so take the components and do it here.
+      const cmyk = await decoder.decode(bytes, {
+        ...params,
+        format: JpegWasmFormat.CMYK32,
+      });
+      if (cmyk.data) {
+        cmyk.data = wantsRgba
+          ? convertCmykToRgba(cmyk.data)
+          : convertCmykToRgb(cmyk.data);
+        result = cmyk;
+      }
+    }
+    if (!result.data) {
+      warn(`JpegStream: Wasm decoding skipped: ${result.reason}.`);
+    }
+    return result;
+  }
+
+  async decodeImage(bytes, _length, decoderOptions = null) {
+    if (this.eof) {
+      return this.buffer;
+    }
+    const skipped = [];
+
+    if (!JpegStream.#useWasm) {
+      skipped.push({ backend: "JpegWasm", reason: "disabled" });
+    } else if (!(this.drawWidth > 0 && this.drawHeight > 0)) {
+      // Nothing to validate the frame against, e.g. an image used as a mask.
+      skipped.push({ backend: "JpegWasm", reason: "unknown dimensions" });
+    } else {
+      bytes = this.#skipUselessBytes(bytes || this.bytes);
+      const start =
+        typeof performance !== "undefined" ? performance.now() : Date.now();
+      let result;
+      try {
+        result = await this.#decodeWithWasm(bytes);
+      } finally {
+        decoderOptions?.profile?.(
+          result?.data
+            ? "decoder: JPEG / Wasm"
+            : "decoder attempt: JPEG / Wasm (failed)",
+          start,
+          typeof performance !== "undefined" ? performance.now() : Date.now()
+        );
+      }
+
+      if (result.data) {
+        return this.#store(
+          result.data,
+          result.width,
+          result.height,
+          "JpegWasm",
+          skipped
+        );
+      }
+      skipped.push({ backend: "JpegWasm", reason: result.reason });
+    }
+    return this.#decodeWithJs(bytes, skipped, decoderOptions);
+  }
+
   get canAsyncDecodeImageFromBuffer() {
     return this.stream.isAsync;
   }
 
   async getTransferableImage(width, height, profile = null) {
     if (!(await JpegStream.canUseImageDecoder)) {
+      this.backendInfo = {
+        backend: null,
+        skipped: [{ backend: "ImageDecoder", reason: "unsupported" }],
+      };
       return null;
     }
     const jpegOptions = this.jpegOptions;
-    let decoder, decodeStart;
+    let decoder, decodeStart, skipReason;
     try {
       // TODO: If the stream is Flate & DCT we could try to just pipe the
       // the DecompressionStream into the ImageDecoder: it'll avoid the
@@ -148,6 +281,7 @@ class JpegStream extends DecodeStream {
           (await this.stream.asyncGetBytes())) ||
         this.bytes;
       if (!bytes) {
+        skipReason = "no data";
         return null;
       }
       let data = this.#skipUselessBytes(bytes);
@@ -156,6 +290,7 @@ class JpegStream extends DecodeStream {
         jpegOptions.colorTransform
       );
       if (!useImageDecoder) {
+        skipReason = "component layout";
         return null;
       }
       const { width: frameWidth, height: frameHeight } = useImageDecoder;
@@ -165,6 +300,7 @@ class JpegStream extends DecodeStream {
         (reducePower || !frameHeight)
       ) {
         // Only downscale when the SOF and image dictionary dimensions match.
+        skipReason = "dimension mismatch";
         return null;
       }
       if (useImageDecoder.exifStart) {
@@ -192,6 +328,7 @@ class JpegStream extends DecodeStream {
       decodeStart =
         typeof performance !== "undefined" ? performance.now() : Date.now();
       const image = (await decoder.decode()).image;
+      this.backendInfo = { backend: "ImageDecoder", skipped: [] };
       profile?.(
         "decoder: JPEG / ImageDecoder",
         decodeStart,
@@ -207,9 +344,17 @@ class JpegStream extends DecodeStream {
         );
       }
       warn(`getTransferableImage - failed: "${reason}".`);
+      skipReason = `${reason}`;
       return null;
     } finally {
       decoder?.close();
+
+      if (skipReason !== undefined) {
+        this.backendInfo = {
+          backend: null,
+          skipped: [{ backend: "ImageDecoder", reason: skipReason }],
+        };
+      }
     }
   }
 

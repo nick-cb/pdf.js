@@ -28,6 +28,7 @@ import { BaseStream } from "./base_stream.js";
 import { ColorSpace } from "./colorspace.js";
 import { ColorSpaceUtils } from "./colorspace_utils.js";
 import { DecodeStream } from "./decode_stream.js";
+import { ImageProfiler } from "./image_profiler.js";
 import { ImageResizer } from "./image_resizer.js";
 import { JpegStream } from "./jpeg_stream.js";
 import { JpxImage } from "./jpx.js";
@@ -108,6 +109,7 @@ class PDFImage {
       }
     }
     this.filterNames = filterNames;
+    this.filterName = filterName;
     switch (filterName) {
       case "JPXDecode":
         ({
@@ -718,24 +720,87 @@ class PDFImage {
     );
   }
 
+  /**
+   * Opens a profile describing the image, for {@linkcode ImageProfiler}.
+   * @param {boolean} forceRGBA
+   * @returns {ImageProfile}
+   */
+  #startImageProfile(forceRGBA) {
+    if (!ImageProfiler.enabled) {
+      return ImageProfiler.disabledProfile;
+    }
+    return ImageProfiler.start({
+      codec: this.filterName ?? "none",
+      width: this.width,
+      height: this.height,
+      drawWidth: this.drawWidth,
+      drawHeight: this.drawHeight,
+      bpc: this.bpc,
+      colorSpace: this.colorSpace?.name ?? null,
+      numComps: this.numComps,
+      colorTransform:
+        this.image instanceof JpegStream
+          ? (this.image.jpegOptions.colorTransform ?? null)
+          : null,
+      hasMask: !!this.mask,
+      hasSMask: !!this.smask,
+      isMask: this.imageMask,
+      needsDecode: !!this.needsDecode,
+      forceRGBA,
+    });
+  }
+
   async createImageData(
     forceRGBA = false,
     isOffscreenCanvasSupported = false,
-    profile = null
+    traceProfile = null
   ) {
-    const startProfile = () =>
+    const imageProfile = this.#startImageProfile(forceRGBA);
+    const stop = imageProfile.timer("createImageData");
+    const startTraceProfile = () =>
       typeof performance !== "undefined" ? performance.now() : Date.now();
-    const addProfile = (name, start, end = startProfile()) => {
-      profile?.(name, start, end);
+    const addTraceProfile = (name, start, end = startTraceProfile()) => {
+      traceProfile?.(name, start, end);
     };
-    if (profile) {
-      const filterTime = startProfile();
-      addProfile(
+    if (traceProfile) {
+      const filterTime = startTraceProfile();
+      addTraceProfile(
         `filter: ${this.filterNames.join(" + ") || "none"}`,
         filterTime,
         filterTime
       );
     }
+    try {
+      const imgData = await this.#createImageData(
+        forceRGBA,
+        isOffscreenCanvasSupported,
+        imageProfile,
+        traceProfile,
+        startTraceProfile,
+        addTraceProfile
+      );
+      stop();
+      imageProfile.end({
+        outputWidth: imgData.width,
+        outputHeight: imgData.height,
+        outputKind: imgData.bitmap ? "bitmap" : imgData.kind,
+      });
+      return imgData;
+    } catch (ex) {
+      stop();
+      imageProfile.end({ error: `${ex}` });
+      throw ex;
+    }
+  }
+
+  async #createImageData(
+    forceRGBA,
+    isOffscreenCanvasSupported,
+    imageProfile,
+    traceProfile,
+    startTraceProfile,
+    addTraceProfile
+  ) {
     const drawWidth = this.drawWidth;
     const drawHeight = this.drawHeight;
     const imgData = {
@@ -760,18 +825,20 @@ class PDFImage {
 
     if (!this.smask && !this.mask && this.colorSpace.name === "DeviceRGBA") {
       imgData.kind = ImageKind.RGBA_32BPP;
-      let stepStart = startProfile();
+      let stepStart = startTraceProfile();
+      const stopRgbaStreamDecode = imageProfile.timer("decode");
       const imgArray = (imgData.data = await this.getImageBytes(
         originalHeight * originalWidth * 4,
         {
           internal: isOffscreenCanvasSupported && mustBeResized,
-          profile,
+          profile: traceProfile,
         }
       ));
-      addProfile("get rgba bytes", stepStart);
+      stopRgbaStreamDecode();
+      addTraceProfile("get rgba bytes", stepStart);
 
       if (this.jpxPremultiplied) {
-        stepStart = startProfile();
+        stepStart = startTraceProfile();
         const matteRgb = this.preblendMatte;
         PDFImage.#undoPreblend(
           imgArray,
@@ -780,24 +847,24 @@ class PDFImage {
           matteRgb?.[1] ?? 0,
           matteRgb?.[2] ?? 0
         );
-        addProfile("undo rgba preblend", stepStart);
+        addTraceProfile("undo rgba preblend", stepStart);
       }
 
       if (isOffscreenCanvasSupported) {
         if (!mustBeResized) {
-          stepStart = startProfile();
+          stepStart = startTraceProfile();
           const bitmap = this.createBitmap(
             ImageKind.RGBA_32BPP,
             drawWidth,
             drawHeight,
             imgArray
           );
-          addProfile("create bitmap", stepStart);
+          addTraceProfile("create bitmap", stepStart);
           return bitmap;
         }
-        stepStart = startProfile();
+        stepStart = startTraceProfile();
         const image = ImageResizer.createImage(imgData, false);
-        addProfile("resize image", stepStart);
+        addTraceProfile("resize image", stepStart);
         return image;
       }
 
@@ -827,25 +894,29 @@ class PDFImage {
         drawWidth === originalWidth &&
         drawHeight === originalHeight
       ) {
-        let stepStart = startProfile();
+        let stepStart = startTraceProfile();
         const image = await this.#getImage(
           originalWidth,
           originalHeight,
-          profile
+          traceProfile
         );
-        addProfile("get cached image", stepStart);
+        addTraceProfile("get cached image", stepStart);
+        imageProfile.mergeBackend(this.image.backendInfo);
         if (image) {
           return image;
         }
-        stepStart = startProfile();
+        stepStart = startTraceProfile();
+        const stopDecode = imageProfile.timer("decode");
         const data = await this.getImageBytes(originalHeight * rowBytes, {
           internal: isOffscreenCanvasSupported && mustBeResized,
-          profile,
+          profile: traceProfile,
         });
-        addProfile("get compact bytes", stepStart);
+        stopDecode();
+        addTraceProfile("get compact bytes", stepStart);
+        imageProfile.mergeBackend(this.image.backendInfo);
         if (isOffscreenCanvasSupported) {
           if (mustBeResized) {
-            stepStart = startProfile();
+            stepStart = startTraceProfile();
             const resizedImage = ImageResizer.createImage(
               {
                 data,
@@ -856,17 +927,17 @@ class PDFImage {
               },
               this.needsDecode
             );
-            addProfile("resize compact image", stepStart);
+            addTraceProfile("resize compact image", stepStart);
             return resizedImage;
           }
-          stepStart = startProfile();
+          stepStart = startTraceProfile();
           const bitmap = this.createBitmap(
             kind,
             originalWidth,
             originalHeight,
             data
           );
-          addProfile("create compact bitmap", stepStart);
+          addTraceProfile("create compact bitmap", stepStart);
           return bitmap;
         }
         imgData.kind = kind;
@@ -878,12 +949,12 @@ class PDFImage {
             kind === ImageKind.GRAYSCALE_1BPP,
             "PDFImage.createImageData: The image must be grayscale."
           );
-          stepStart = startProfile();
+          stepStart = startTraceProfile();
           const buffer = imgData.data;
           for (let i = 0, ii = buffer.length; i < ii; i++) {
             buffer[i] ^= 0xff;
           }
-          addProfile("decode compact grayscale", stepStart);
+          addTraceProfile("decode compact grayscale", stepStart);
         }
         return imgData;
       }
@@ -899,9 +970,14 @@ class PDFImage {
         if (isHandled) {
           if (isOffscreenCanvasSupported) {
             // Try ImageDecoder before the pixel-buffer fallback.
-            const stepStart = startProfile();
-            const image = await this.#getImage(drawWidth, drawHeight, profile);
-            addProfile("get cached jpeg image", stepStart);
+            const stepStart = startTraceProfile();
+            const image = await this.#getImage(
+              drawWidth,
+              drawHeight,
+              traceProfile
+            );
+            addTraceProfile("get cached jpeg image", stepStart);
+            imageProfile.mergeBackend(this.image.backendInfo);
             if (image) {
               return image;
             }
@@ -918,42 +994,75 @@ class PDFImage {
                 imageLength = (imageLength / 3) * 4;
                 break;
             }
-            let stepStart = startProfile();
+            let stepStart = startTraceProfile();
+            const stopRgbaDecode = imageProfile.timer("decode");
             const rgba = await this.getImageBytes(imageLength, {
               drawWidth,
               drawHeight,
               forceRGBA: true,
               internal: true,
-              profile,
+              profile: traceProfile,
             });
-            addProfile("get jpeg rgba bytes", stepStart);
-            stepStart = startProfile();
+            stopRgbaDecode();
+            addTraceProfile("get jpeg rgba bytes", stepStart);
+            imageProfile.mergeBackend(this.image.backendInfo);
+
+            stepStart = startTraceProfile();
             const bitmap = this.createBitmap(
               ImageKind.RGBA_32BPP,
               drawWidth,
               drawHeight,
               rgba
             );
-            addProfile("create jpeg bitmap", stepStart);
+            addTraceProfile("create jpeg bitmap", stepStart);
             return bitmap;
           }
           if (this.colorSpace.name === "DeviceGray") {
             imageLength *= 3;
           }
+          // An image too large for a canvas is decoded straight to a size that
+          // fits, when the decoder can do it, rather than decoded in full and
+          // downscaled afterwards; that saves the decoder work, the full-size
+          // buffer and the resize pass. `JpegImage` ignores the request, so the
+          // dimensions that come back are what the decode actually produced.
+          const reducePower = mustBeResized
+            ? ImageResizer.getReducePower(drawWidth, drawHeight)
+            : 0;
+          imageProfile.set({ reducePower });
+
+          const stopRgbDecode = imageProfile.timer("decode");
           imgData.kind = ImageKind.RGB_24BPP;
-          let stepStart = startProfile();
+          let stepStart = startTraceProfile();
           imgData.data = await this.getImageBytes(imageLength, {
             drawWidth,
             drawHeight,
+            reducePower,
             forceRGB: true,
             internal: mustBeResized,
-            profile,
+            profile: traceProfile,
           });
-          addProfile("get jpeg rgb bytes", stepStart);
-          if (mustBeResized) {
-            stepStart = startProfile();
-            const image = ImageResizer.createImage(imgData);
-            addProfile("resize jpeg image", stepStart);
+          stopRgbDecode();
+          addTraceProfile("get jpeg rgb bytes", stepStart);
+          imageProfile.mergeBackend(this.image.backendInfo);
+          imgData.width = this.image.decodedWidth;
+          imgData.height = this.image.decodedHeight;
+
+          if (isOffscreenCanvasSupported) {
+            if (ImageResizer.needsToBeResized(imgData.width, imgData.height)) {
+              stepStart = startTraceProfile();
+              const image = ImageResizer.createImage(imgData);
+              addTraceProfile("resize jpeg image", stepStart);
+              return image;
+            }
+            // A reduced decode brought it back within the canvas limits.
+            stepStart = startTraceProfile();
+            const image = this.createBitmap(
+              ImageKind.RGB_24BPP,
+              imgData.width,
+              imgData.height,
+              imgData.data
+            );
+            addTraceProfile("create jpeg bitmap", stepStart);
             return image;
           }
           return imgData;
@@ -961,19 +1070,46 @@ class PDFImage {
       }
     }
 
-    let stepStart = startProfile();
+    if (
+      isOffscreenCanvasSupported &&
+      !mustBeResized &&
+      !this.needsDecode &&
+      bpc === 8 &&
+      drawWidth === originalWidth &&
+      drawHeight === originalHeight &&
+      // A color key mask is the one kind that needs the original components.
+      !Array.isArray(this.mask) &&
+      (forceRGBA || this.smask || this.mask) &&
+      (this.colorSpace.name === "DeviceGray" ||
+        this.colorSpace.name === "DeviceRGB") &&
+      this.image instanceof JpegStream
+    ) {
+      const nativeData = await this.#createImageDataFromFrame(
+        drawWidth,
+        drawHeight,
+        imageProfile,
+        traceProfile
+      );
+      if (nativeData) {
+        return nativeData;
+      }
+    }
+    let stepStart = startTraceProfile();
+    const stopDecode = imageProfile.timer("decode");
     const imgArray = await this.getImageBytes(originalHeight * rowBytes, {
       internal: true,
-      profile,
+      profile: traceProfile,
     });
-    addProfile("get raw bytes", stepStart);
+    stopDecode();
+    addTraceProfile("get raw bytes", stepStart);
+    imageProfile.mergeBackend(this.image.backendInfo);
     // imgArray can be incomplete (e.g. after CCITT fax encoding).
     const actualHeight =
       0 | (((imgArray.length / rowBytes) * drawHeight) / originalHeight);
 
-    stepStart = startProfile();
+    stepStart = startTraceProfile();
     const comps = this.getComponents(imgArray);
-    addProfile("unpack components", stepStart);
+    addTraceProfile("unpack components", stepStart);
 
     // If opacity data is present, use RGBA_32BPP form. Otherwise, use the
     // more compact RGB_24BPP form if allowable.
@@ -981,12 +1117,12 @@ class PDFImage {
 
     let canvas, ctx, canvasImgData, data;
     if (isOffscreenCanvasSupported && !mustBeResized) {
-      stepStart = startProfile();
+      stepStart = startTraceProfile();
       canvas = new OffscreenCanvas(drawWidth, drawHeight);
       ctx = canvas.getContext("2d");
       canvasImgData = ctx.createImageData(drawWidth, drawHeight);
       data = canvasImgData.data;
-      addProfile("create offscreen buffer", stepStart);
+      addTraceProfile("create offscreen buffer", stepStart);
     }
 
     imgData.kind = ImageKind.RGBA_32BPP;
@@ -1011,17 +1147,18 @@ class PDFImage {
       maybeUndoPreblend = true;
 
       // Color key masking (opacity) must be performed before decoding.
-      stepStart = startProfile();
+      stepStart = startTraceProfile();
       await this.fillOpacity(data, drawWidth, drawHeight, actualHeight, comps);
-      addProfile("fill opacity", stepStart);
+      addTraceProfile("fill opacity", stepStart);
     }
 
     if (this.needsDecode) {
-      stepStart = startProfile();
+      stepStart = startTraceProfile();
       this.decodeBuffer(comps);
-      addProfile("decode components", stepStart);
+      addTraceProfile("decode components", stepStart);
     }
-    stepStart = startProfile();
+    stepStart = startTraceProfile();
+    const stopConversion = imageProfile.timer("colorConversion");
     this.colorSpace.fillRgb(
       data,
       originalWidth,
@@ -1033,18 +1170,19 @@ class PDFImage {
       comps,
       alpha01
     );
-    addProfile("color conversion", stepStart);
+    stopConversion();
+    addTraceProfile("color conversion", stepStart);
     if (maybeUndoPreblend) {
-      stepStart = startProfile();
+      stepStart = startTraceProfile();
       this.undoPreblend(data, drawWidth, actualHeight);
-      addProfile("undo preblend", stepStart);
+      addTraceProfile("undo preblend", stepStart);
     }
 
     if (isOffscreenCanvasSupported && !mustBeResized) {
-      stepStart = startProfile();
+      stepStart = startTraceProfile();
       ctx.putImageData(canvasImgData, 0, 0);
       const bitmap = canvas.transferToImageBitmap();
-      addProfile("transfer bitmap", stepStart);
+      addTraceProfile("transfer bitmap", stepStart);
 
       return {
         data: null,
@@ -1057,9 +1195,9 @@ class PDFImage {
 
     imgData.data = data;
     if (mustBeResized) {
-      stepStart = startProfile();
+      stepStart = startTraceProfile();
       const image = ImageResizer.createImage(imgData);
-      addProfile("resize image", stepStart);
+      addTraceProfile("resize image", stepStart);
       return image;
     }
     return imgData;
@@ -1229,11 +1367,68 @@ class PDFImage {
     };
   }
 
-  async #getImage(width, height, profile = null) {
+  /**
+   * Decodes natively and copies the frame's pixels out, for images that can't
+   * be handed over as a bitmap because PDF.js still has to composite a mask
+   * into them. The copy is the destination buffer, so this costs one
+   * allocation and no extra pass over the pixels.
+   * @param {number} width
+   * @param {number} height
+   * @param {ImageProfile} imageProfile
+   * @param {Function|null} traceProfile
+   * @returns {Promise<object | null>} The image data, or `null` when the native
+   *   decoder can't be used for this image.
+   */
+  async #createImageDataFromFrame(width, height, imageProfile, traceProfile) {
+    const frame = await this.image.getTransferableImage(
+      width,
+      height,
+      traceProfile
+    );
+    imageProfile.mergeBackend(this.image.backendInfo);
+    if (!frame) {
+      return null;
+    }
+    let data;
+    try {
+      const layout = { format: "RGBA" };
+      // A frame whose dimensions or layout aren't what was asked for would
+      // need work that the ordinary path does better.
+      if (
+        frame.displayWidth !== width ||
+        frame.displayHeight !== height ||
+        frame.allocationSize(layout) !== width * height * 4
+      ) {
+        imageProfile.skip("ImageDecoder", "unexpected frame layout");
+        return null;
+      }
+      data = new Uint8ClampedArray(width * height * 4);
+      await frame.copyTo(data, layout);
+    } catch (reason) {
+      warn(`PDFImage.#createImageDataFromFrame - failed: "${reason}".`);
+      imageProfile.skip("ImageDecoder", `copyTo: ${reason}`);
+      return null;
+    } finally {
+      frame.close();
+    }
+    const stopConversion = imageProfile.timer("colorConversion");
+    // The frame is already RGB, and opaque since JPEG carries no alpha, so
+    // only a mask and the matte are left to apply.
+    if (this.smask || this.mask) {
+      await this.fillOpacity(data, width, height, height, null);
+    }
+    this.undoPreblend(data, width, height);
+    stopConversion();
+
+    imageProfile.backend("ImageDecoder");
+    return this.createBitmap(ImageKind.RGBA_32BPP, width, height, data);
+  }
+
+  async #getImage(width, height, traceProfile = null) {
     const bitmap = await this.image.getTransferableImage(
       width,
       height,
-      profile
+      traceProfile
     );
     if (!bitmap) {
       return null;
@@ -1257,6 +1452,7 @@ class PDFImage {
       forceRGB = false,
       internal = false,
       profile = null,
+      reducePower = 0,
     }
   ) {
     this.image.reset();
@@ -1264,6 +1460,7 @@ class PDFImage {
     this.image.drawHeight = drawHeight || this.height;
     this.image.forceRGBA = !!forceRGBA;
     this.image.forceRGB = !!forceRGB;
+    this.image.reducePower = reducePower;
     let decoderReported = false;
     const start =
       typeof performance !== "undefined" ? performance.now() : Date.now();

@@ -719,6 +719,17 @@ function createWasmBundle({ includeQuickJS = true } = {}) {
         encoding: false,
       }
     ),
+    gulp.src(
+      [
+        "external/libjpeg/*.wasm",
+        "external/libjpeg/libjpeg_nowasm_fallback.js",
+        "external/libjpeg/LICENSE_*",
+      ],
+      {
+        base: "external/libjpeg",
+        encoding: false,
+      }
+    ),
     gulp.src(["external/qcms/*.wasm", "external/qcms/LICENSE_*"], {
       base: "external/qcms",
       encoding: false,
@@ -1759,7 +1770,7 @@ async function buildMozcentral(changedFiles = null) {
       create: createStandardFontBundle,
     },
     {
-      files: /^external\/(jbig2|openjpeg|qcms)\//,
+      files: /^external\/(jbig2|libjpeg|openjpeg|qcms)\//,
       dest: MOZCENTRAL_WEB_DIR + "/wasm",
       create: () => createWasmBundle({ includeQuickJS: false }),
     },
@@ -2054,6 +2065,7 @@ function watchMozcentral(done) {
     "external/bcmaps/*",
     "external/iccs/*",
     "external/jbig2/*",
+    "external/libjpeg/*",
     "external/openjpeg/*",
     "external/qcms/*",
     "external/standard_fonts/*",
@@ -2365,6 +2377,11 @@ function buildLib(defines, dir) {
     }),
     gulp.src("test/unit/*.js", {
       base: ".",
+      encoding: false,
+      sourcemaps: enableSourceMaps,
+    }),
+    gulp.src("external/libjpeg/*.js", {
+      base: "libjpeg/",
       encoding: false,
       sourcemaps: enableSourceMaps,
     }),
@@ -3112,6 +3129,7 @@ gulp.task(
     function watchWasm() {
       gulp.watch(
         [
+          "external/libjpeg/*",
           "external/openjpeg/*",
           "external/qcms/*",
           "external/jbig2/*",

@@ -21,6 +21,7 @@ import {
   warn,
 } from "../shared/util.js";
 import { ChunkedStreamManager } from "./chunked_stream.js";
+import { ImageProfiler } from "./image_profiler.js";
 import { ImageResizer } from "./image_resizer.js";
 import { JpegStream } from "./jpeg_stream.js";
 import { MissingDataException } from "./core_utils.js";
@@ -80,6 +81,7 @@ class BasePdfManager {
     this.evaluatorOptions = Object.freeze(evaluatorOptions);
 
     // Initialize image-options once per document.
+    ImageProfiler.setOptions(evaluatorOptions);
     ImageResizer.setOptions(evaluatorOptions);
     JpegStream.setOptions(evaluatorOptions);
     OperatorList.setOptions(evaluatorOptions);
