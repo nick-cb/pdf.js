@@ -40,14 +40,17 @@ class JpxImage extends WasmImage {
       isIndexedColormap = false,
       smaskInData = false,
       reducePower = 0,
+      profile = null,
     } = {}
   ) {
+    const start =
+      typeof performance !== "undefined" ? performance.now() : Date.now();
     const module = await this._getModule(OpenJPEG);
 
     if (!module) {
       throw new JpxError("OpenJPEG failed to initialize");
     }
-    let ptr;
+    let ptr, succeeded;
 
     try {
       const size = bytes.length;
@@ -71,9 +74,17 @@ class JpxImage extends WasmImage {
       }
       const { imageData } = module;
       module.imageData = null;
+      succeeded = true;
 
       return imageData;
     } finally {
+      profile?.(
+        succeeded
+          ? `decoder: JPEG2000 / OpenJPEG ${this.decoderType}`
+          : `decoder attempt: JPEG2000 / OpenJPEG ${this.decoderType} (failed)`,
+        start,
+        typeof performance !== "undefined" ? performance.now() : Date.now()
+      );
       if (ptr) {
         module._free(ptr);
       }

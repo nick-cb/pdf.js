@@ -71,7 +71,7 @@ class Jbig2Stream extends DecodeStream {
     return bytes;
   }
 
-  async decodeImage(bytes, length, _decoderOptions) {
+  async decodeImage(bytes, length, decoderOptions) {
     if (this.eof) {
       return this.buffer;
     }
@@ -84,12 +84,27 @@ class Jbig2Stream extends DecodeStream {
         globals = Jbig2Stream.stripFileHeader(globalsStream.getBytes());
       }
     }
-    this.buffer = await JBig2CCITTFaxImage.instance.decode(
-      bytes,
-      this.dict.get("Width"),
-      this.dict.get("Height"),
-      globals
-    );
+    const decoder = JBig2CCITTFaxImage.instance;
+    const start =
+      typeof performance !== "undefined" ? performance.now() : Date.now();
+    let succeeded = false;
+    try {
+      this.buffer = await decoder.decode(
+        bytes,
+        this.dict.get("Width"),
+        this.dict.get("Height"),
+        globals
+      );
+      succeeded = true;
+    } finally {
+      decoderOptions?.profile?.(
+        succeeded
+          ? `decoder: JBIG2 / ${decoder.decoderType}`
+          : `decoder attempt: JBIG2 / ${decoder.decoderType} (failed)`,
+        start,
+        typeof performance !== "undefined" ? performance.now() : Date.now()
+      );
+    }
     this.bufferLength = this.buffer.length;
     this.eof = true;
 

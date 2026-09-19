@@ -302,67 +302,139 @@ class StatTimer {
                 !childUsed.has(imageChild.index) &&
                 imageChild.name.startsWith(`O: image ${detail}: `)
             );
-            for (const imageChild of imageChildren) {
-              addChild(imageChild, childIndent + 1);
+            for (const imageChild of children) {
+              if (
+                imageChildren.includes(imageChild) &&
+                !imageChildren.some(parent =>
+                  imageChild.name.startsWith(`${parent.name}: `)
+                )
+              ) {
+                addChild(imageChild, childIndent + 1);
+                for (const nestedImageChild of imageChildren) {
+                  if (
+                    !childUsed.has(nestedImageChild.index) &&
+                    nestedImageChild.name.startsWith(`${imageChild.name}: `)
+                  ) {
+                    addChildWithName(
+                      nestedImageChild,
+                      `O: ${nestedImageChild.name.slice(imageChild.name.length + 2)}`,
+                      childIndent + 2
+                    );
+                  }
+                }
+              }
             }
           }
         };
-        const opChildren = children.filter(c => c.name.startsWith("O: "));
-        const nonOpChildren = children.filter(c => !c.name.startsWith("O: "));
-        addOperatorChildren(1);
-        for (const child of nonOpChildren) {
-          if (!childUsed.has(child.index)) {
-            addChild(child, 1);
+
+        for (const child of children) {
+          if (
+            !child.name.startsWith("O: page operator list") &&
+            !child.name.startsWith("O: annotation operator lists") &&
+            !child.name.startsWith("O: op ") &&
+            !child.name.startsWith("O: image ")
+          ) {
+            addChild(child, indent);
           }
         }
-        for (const child of opChildren) {
-          if (!childUsed.has(child.index) && !child.name.startsWith("O: op ")) {
-            addChild(child, 1);
+
+        const pageOperatorList = children.find(child =>
+          child.name.startsWith("O: page operator list")
+        );
+        if (pageOperatorList) {
+          addChild(pageOperatorList, indent);
+          addOperatorChildren(indent + 1);
+        } else {
+          addOperatorChildren(indent);
+        }
+
+        for (const child of children) {
+          if (!childUsed.has(child.index)) {
+            addChild(child, indent);
           }
         }
       };
 
       const overall = getFirst("Overall");
-      const pageRequest = getFirst("Page Request");
-      const renderingReady = getFirst("Rendering Ready");
+      if (overall) {
+        add(overall);
+      }
+
+      const topIndent = overall ? 1 : 0;
+      addExact("Page Request", topIndent);
+      addExact("Rendering Ready", topIndent);
+
       const rendering = getFirst("Rendering");
-      const graphicsInit = getFirst("Graphics Init");
-
-      if (overall) add(overall, 0);
-      if (pageRequest) add(pageRequest, 0);
-      if (renderingReady) add(renderingReady, 0);
-      if (rendering) add(rendering, 0);
-      if (graphicsInit) add(graphicsInit, 0);
-
-      for (const entry of entries) {
-        if (used.has(entry.index)) continue;
-        if (/^O: chunk/.test(entry.name)) {
-          const chunkChildren = entries.filter(
-            e =>
-              !used.has(e.index) &&
-              e.name.startsWith("O: ") &&
-              Math.abs(e.start - entry.start) < 5000 &&
-              e.start >= entry.start &&
-              e.end <= entry.end + 10000
-          );
-          add(entry, 0);
-          addOperatorListProfile(chunkChildren, 1);
-        }
+      if (rendering) {
+        add(rendering, topIndent);
       }
-      for (const entry of entries) {
-        if (!used.has(entry.index) && /^E: /.test(entry.name)) {
-          add(entry, 0);
+
+      const renderingIndent = rendering ? topIndent + 1 : topIndent;
+      for (let i = 0, ii = entries.length; i < ii; i++) {
+        const entry = entries[i];
+        if (used.has(entry.index)) {
+          continue;
         }
-      }
-      for (const entry of entries) {
-        if (!used.has(entry.index)) {
-          add(entry, 0);
+
+        if (entry.name.startsWith("O: chunk wait")) {
+          add(entry, renderingIndent);
+          const children = [];
+          while (i + 1 < ii) {
+            const child = entries[i + 1];
+            if (
+              used.has(child.index) ||
+              !child.name.startsWith("O: ") ||
+              child.name.startsWith("O: chunk wait")
+            ) {
+              break;
+            }
+            children.push(child);
+            i++;
+          }
+          addOperatorListProfile(children, renderingIndent + 1);
+          continue;
         }
+
+        if (
+          entry.name.startsWith("E: op ") ||
+          entry.name.startsWith("E: dependency ")
+        ) {
+          const children = [entry];
+          used.add(entry.index);
+          let slice = null;
+          while (++i < ii) {
+            const child = entries[i];
+            if (used.has(child.index) || !child.name.startsWith("E: ")) {
+              i--;
+              break;
+            }
+            used.add(child.index);
+            if (child.name.startsWith("E: slice")) {
+              slice = child;
+              break;
+            }
+            children.push(child);
+          }
+          if (slice) {
+            rows.push({ entry: slice, indent: renderingIndent });
+            for (const child of children) {
+              rows.push({ entry: child, indent: renderingIndent + 1 });
+            }
+          } else {
+            for (const child of children) {
+              rows.push({ entry: child, indent: renderingIndent });
+            }
+          }
+          continue;
+        }
+
+        add(entry, renderingIndent);
       }
     } else {
       rows = entries.map(entry => ({ entry, indent: 0 }));
     }
 
+    // Find the longest name for padding purposes.
     const outBuf = [];
     let longest = 0;
     const formatName = name => name.replace(/^[EO]: /, "");

@@ -59,8 +59,8 @@ class JpegStream extends DecodeStream {
     // directly insert all of its data into `this.buffer`.
   }
 
-  readBlock() {
-    this.decodeImage();
+  readBlock(decoderOptions) {
+    this.decodeImage(null, null, decoderOptions);
   }
 
   get jpegOptions() {
@@ -90,41 +90,55 @@ class JpegStream extends DecodeStream {
     return data;
   }
 
-  decodeImage(bytes) {
+  decodeImage(bytes, _length, decoderOptions = null) {
     if (this.eof) {
       return this.buffer;
     }
-    bytes = this.#skipUselessBytes(bytes || this.bytes);
+    const start =
+      typeof performance !== "undefined" ? performance.now() : Date.now();
+    let succeeded = false;
+    try {
+      bytes = this.#skipUselessBytes(bytes || this.bytes);
 
-    // TODO: if an image has a mask we need to combine the data.
-    // So ideally get a VideoFrame from getTransferableImage and then use
-    // copyTo.
+      // TODO: if an image has a mask we need to combine the data.
+      // So ideally get a VideoFrame from getTransferableImage and then use
+      // copyTo.
 
-    const jpegImage = new JpegImage(this.jpegOptions);
-    jpegImage.parse(bytes);
-    const data = jpegImage.getData({
-      width: this.drawWidth,
-      height: this.drawHeight,
-      forceRGBA: this.forceRGBA,
-      forceRGB: this.forceRGB,
-    });
-    this.buffer = data;
-    this.bufferLength = data.length;
-    this.eof = true;
+      const jpegImage = new JpegImage(this.jpegOptions);
+      jpegImage.parse(bytes);
+      const data = jpegImage.getData({
+        width: this.drawWidth,
+        height: this.drawHeight,
+        forceRGBA: this.forceRGBA,
+        forceRGB: this.forceRGB,
+      });
+      this.buffer = data;
+      this.bufferLength = data.length;
+      this.eof = true;
+      succeeded = true;
 
-    return this.buffer;
+      return this.buffer;
+    } finally {
+      decoderOptions?.profile?.(
+        succeeded
+          ? "decoder: JPEG / JavaScript"
+          : "decoder attempt: JPEG / JavaScript (failed)",
+        start,
+        typeof performance !== "undefined" ? performance.now() : Date.now()
+      );
+    }
   }
 
   get canAsyncDecodeImageFromBuffer() {
     return this.stream.isAsync;
   }
 
-  async getTransferableImage(width, height) {
+  async getTransferableImage(width, height, profile = null) {
     if (!(await JpegStream.canUseImageDecoder)) {
       return null;
     }
     const jpegOptions = this.jpegOptions;
-    let decoder;
+    let decoder, decodeStart;
     try {
       // TODO: If the stream is Flate & DCT we could try to just pipe the
       // the DecompressionStream into the ImageDecoder: it'll avoid the
@@ -175,8 +189,23 @@ class JpegStream extends DecodeStream {
       }
       decoder = new ImageDecoder(init);
 
-      return (await decoder.decode()).image;
+      decodeStart =
+        typeof performance !== "undefined" ? performance.now() : Date.now();
+      const image = (await decoder.decode()).image;
+      profile?.(
+        "decoder: JPEG / ImageDecoder",
+        decodeStart,
+        typeof performance !== "undefined" ? performance.now() : Date.now()
+      );
+      return image;
     } catch (reason) {
+      if (decodeStart !== undefined) {
+        profile?.(
+          "decoder attempt: JPEG / ImageDecoder (failed)",
+          decodeStart,
+          typeof performance !== "undefined" ? performance.now() : Date.now()
+        );
+      }
       warn(`getTransferableImage - failed: "${reason}".`);
       return null;
     } finally {

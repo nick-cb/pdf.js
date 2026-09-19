@@ -36,7 +36,7 @@ const [
 ] = await Promise.all([
   import("../src/display/canvas.js"),
   import("../src/display/pdf_objects.js"),
-  import("../src/display/display_utils.js"),
+  import("../src/display/page_viewport.js"),
   import("../src/display/canvas_factory.js"),
   import("../src/shared/util.js"),
 ]);

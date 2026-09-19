@@ -1587,8 +1587,9 @@ class PDFPageProxy {
       }
 
       if (this._stats) {
-        this._stats.timeEnd("Rendering");
-        this._stats.timeEnd("Overall");
+        this._stats.timeEndIfStarted("Rendering Ready");
+        this._stats.timeEndIfStarted("Rendering");
+        this._stats.timeEndIfStarted("Overall");
 
         if (globalThis.Stats?.enabled) {
           globalThis.Stats.add(this.pageNumber, this._stats);
@@ -1637,11 +1638,13 @@ class PDFPageProxy {
       pageColors,
       enableHWA: this._transport.enableHWA,
       operationsFilter,
+      stats: this._stats,
     });
 
     (intentState.renderTasks ||= new Set()).add(internalRenderTask);
     const renderTask = internalRenderTask.task;
 
+    this._stats?.time("Rendering Ready");
     Promise.all([
       intentState.displayReadyCapability.promise,
       optionalContentConfigPromise,
@@ -1651,6 +1654,7 @@ class PDFPageProxy {
           complete();
           return;
         }
+        this._stats?.timeEnd("Rendering Ready");
         this._stats?.time("Rendering");
 
         if (!(optionalContentConfig.renderingIntent & renderingIntent)) {
@@ -1875,6 +1879,14 @@ class PDFPageProxy {
    * @private
    */
   _renderPageChunk(operatorListChunk, intentState) {
+    const start = this._stats ? Date.now() : 0;
+    for (const {
+      name,
+      start: profileStart,
+      end,
+    } of operatorListChunk.profile || []) {
+      this._stats?.add(`O: ${name}`, 0, end - profileStart);
+    }
     // Add the new chunk to the current operator list.
     for (let i = 0, ii = operatorListChunk.length; i < ii; i++) {
       intentState.operatorList.fnArray.push(operatorListChunk.fnArray[i]);
@@ -1887,6 +1899,11 @@ class PDFPageProxy {
     for (const internalRenderTask of intentState.renderTasks) {
       internalRenderTask.operatorListChanged();
     }
+
+    this._stats?.add(
+      `OperatorList Chunk Processing (${operatorListChunk.length} ops)`,
+      start
+    );
 
     if (operatorListChunk.lastChunk) {
       this.#tryCleanup();
@@ -1928,16 +1945,26 @@ class PDFPageProxy {
     const intentState = this._intentStates.get(cacheKey);
     intentState.streamReader = reader;
 
+    const stats = this._stats;
+    let chunkIndex = 0;
+
     const pump = () => {
+      const readStart = stats ? Date.now() : 0;
       reader.read().then(
         ({ value, done }) => {
           if (done) {
+            stats?.add("OperatorList Stream Close", readStart);
             intentState.streamReader = null;
             return;
           }
           if (this._transport.destroyed) {
             return; // Ignore any pending requests if the worker was terminated.
           }
+          chunkIndex++;
+          stats?.add(
+            `O: chunk wait ${chunkIndex} (${value.length} ops)`,
+            readStart
+          );
           this._renderPageChunk(value, intentState);
           pump();
         },
@@ -1999,7 +2026,10 @@ class PDFPageProxy {
       // Don't immediately abort parsing on the worker-thread when rendering is
       // cancelled, since that will unnecessarily delay re-rendering when (for
       // partially parsed pages) e.g. zooming/rotation occurs in the viewer.
-      if (reason instanceof RenderingCancelledException) {
+      if (
+        reason instanceof RenderingCancelledException &&
+        !reason.abortOperatorList
+      ) {
         let delay = RENDERING_CANCELLED_TIMEOUT;
         if (reason.extraDelay > 0 && reason.extraDelay < /* ms = */ 1000) {
           // Above, we prevent the total delay from becoming arbitrarily large.
@@ -2630,6 +2660,20 @@ class WorkerTransport {
 
   setupMessageHandler() {
     const { messageHandler, loadingTask } = this;
+    const addImageProfile = (pageIndex, imageData, profile) => {
+      profile ||= imageData?.profile;
+      if (!profile) {
+        return;
+      }
+      if (imageData?.profile) {
+        delete imageData.profile;
+      }
+
+      const stats = this.#pageCache.get(pageIndex)?._stats;
+      for (const { name, start, end } of profile) {
+        stats?.add(`O: ${name}`, 0, end - start);
+      }
+    };
 
     messageHandler.on("GetReader", (data, sink) => {
       assert(
@@ -2793,114 +2837,130 @@ class WorkerTransport {
       page._startRenderPage(data.transparency, data.cacheKey);
     });
 
-    messageHandler.on("commonobj", ([id, type, exportedData]) => {
-      if (this.destroyed) {
-        return null; // Ignore any pending requests if the worker was terminated.
-      }
+    messageHandler.on(
+      "commonobj",
+      ([id, type, exportedData, pageIndex, imageProfile]) => {
+        if (this.destroyed) {
+          return null; // Ignore any pending requests if the worker was terminated.
+        }
 
-      if (this.commonObjs.has(id)) {
+        if (this.commonObjs.has(id)) {
+          return null;
+        }
+
+        switch (type) {
+          case "Font":
+            if ("error" in exportedData) {
+              const exportedError = exportedData.error;
+              warn(`Error during font loading: ${exportedError}`);
+              this.commonObjs.resolve(id, exportedError);
+              break;
+            }
+
+            const fontData = new FontInfo(exportedData);
+            const inspectFont =
+              this._params.pdfBug && globalThis.FontInspector?.enabled
+                ? (font, url) => globalThis.FontInspector.fontAdded(font, url)
+                : null;
+            const font = new FontFaceObject(
+              fontData,
+              inspectFont,
+              exportedData.charProcOperatorList,
+              exportedData.extra
+            );
+
+            this.fontLoader
+              .bind(font)
+              .catch(() =>
+                messageHandler.sendWithPromise("FontFallback", { id })
+              )
+              .finally(() => {
+                if (!font.fontExtraProperties) {
+                  // Immediately release the `font.data` property once the font
+                  // has been attached to the DOM, since it's no longer needed,
+                  // rather than waiting for a `PDFDocumentProxy.cleanup` call.
+                  // Since `font.data` could be very large, e.g. in some cases
+                  // multiple megabytes, this will help reduce memory usage.
+                  font.clearData();
+                }
+                this.commonObjs.resolve(id, font);
+              });
+            break;
+          case "CopyLocalImage":
+            const { imageRef } = exportedData;
+            assert(imageRef, "The imageRef must be defined.");
+
+            for (const pageProxy of this.#pageCache.values()) {
+              for (const [, data] of pageProxy.objs) {
+                if (data?.ref !== imageRef) {
+                  continue;
+                }
+                if (!data.dataLen) {
+                  return null;
+                }
+                const copy = structuredClone(data);
+                if (
+                  typeof PDFJSDev === "undefined" ||
+                  PDFJSDev.test("TESTING")
+                ) {
+                  copy.CopyLocalImage = true;
+                }
+                this.commonObjs.resolve(id, copy);
+                return data.dataLen;
+              }
+            }
+            break;
+          case "FontPath":
+            this.commonObjs.resolve(id, new FontPathInfo(exportedData));
+            break;
+          case "Image":
+            addImageProfile(pageIndex, exportedData, imageProfile);
+            this.commonObjs.resolve(id, exportedData);
+            break;
+          case "Pattern":
+            const pattern = new PatternInfo(exportedData);
+            this.commonObjs.resolve(id, pattern.getIR());
+            break;
+          default:
+            throw new Error(`Got unknown common object type ${type}`);
+        }
+
         return null;
       }
+    );
 
-      switch (type) {
-        case "Font":
-          if ("error" in exportedData) {
-            const exportedError = exportedData.error;
-            warn(`Error during font loading: ${exportedError}`);
-            this.commonObjs.resolve(id, exportedError);
+    messageHandler.on(
+      "obj",
+      ([id, pageIndex, type, imageData, imageProfile]) => {
+        if (this.destroyed) {
+          // Ignore any pending requests if the worker was terminated.
+          return;
+        }
+
+        const pageProxy = this.#pageCache.get(pageIndex);
+        if (pageProxy.objs.has(id)) {
+          return;
+        }
+        // Don't store data *after* cleanup has successfully run,
+        // see bug 1854145.
+        if (pageProxy._intentStates.size === 0) {
+          imageData?.bitmap?.close(); // Release any `ImageBitmap` data.
+          return;
+        }
+
+        switch (type) {
+          case "Image":
+            addImageProfile(pageIndex, imageData, imageProfile);
+            pageProxy.objs.resolve(id, imageData);
             break;
-          }
-
-          const fontData = new FontInfo(exportedData);
-          const inspectFont =
-            this._params.pdfBug && globalThis.FontInspector?.enabled
-              ? (font, url) => globalThis.FontInspector.fontAdded(font, url)
-              : null;
-          const font = new FontFaceObject(
-            fontData,
-            inspectFont,
-            exportedData.charProcOperatorList,
-            exportedData.extra
-          );
-
-          this.fontLoader
-            .bind(font)
-            .catch(() => messageHandler.sendWithPromise("FontFallback", { id }))
-            .finally(() => {
-              if (!font.fontExtraProperties) {
-                // Immediately release the `font.data` property once the font
-                // has been attached to the DOM, since it's no longer needed,
-                // rather than waiting for a `PDFDocumentProxy.cleanup` call.
-                // Since `font.data` could be very large, e.g. in some cases
-                // multiple megabytes, this will help reduce memory usage.
-                font.clearData();
-              }
-              this.commonObjs.resolve(id, font);
-            });
-          break;
-        case "CopyLocalImage":
-          const { imageRef } = exportedData;
-          assert(imageRef, "The imageRef must be defined.");
-
-          for (const pageProxy of this.#pageCache.values()) {
-            for (const [, data] of pageProxy.objs) {
-              if (data?.ref !== imageRef) {
-                continue;
-              }
-              if (!data.dataLen) {
-                return null;
-              }
-              const copy = structuredClone(data);
-              if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
-                copy.CopyLocalImage = true;
-              }
-              this.commonObjs.resolve(id, copy);
-              return data.dataLen;
-            }
-          }
-          break;
-        case "FontPath":
-          this.commonObjs.resolve(id, new FontPathInfo(exportedData));
-          break;
-        case "Image":
-          this.commonObjs.resolve(id, exportedData);
-          break;
-        case "Pattern":
-          const pattern = new PatternInfo(exportedData);
-          this.commonObjs.resolve(id, pattern.getIR());
-          break;
-        default:
-          throw new Error(`Got unknown common object type ${type}`);
+          case "Pattern":
+            pageProxy.objs.resolve(id, imageData);
+            break;
+          default:
+            throw new Error(`Got unknown object type ${type}`);
+        }
       }
-
-      return null;
-    });
-
-    messageHandler.on("obj", ([id, pageIndex, type, imageData]) => {
-      if (this.destroyed) {
-        // Ignore any pending requests if the worker was terminated.
-        return;
-      }
-
-      const pageProxy = this.#pageCache.get(pageIndex);
-      if (pageProxy.objs.has(id)) {
-        return;
-      }
-      // Don't store data *after* cleanup has successfully run, see bug 1854145.
-      if (pageProxy._intentStates.size === 0) {
-        imageData?.bitmap?.close(); // Release any `ImageBitmap` data.
-        return;
-      }
-
-      switch (type) {
-        case "Image":
-        case "Pattern":
-          pageProxy.objs.resolve(id, imageData);
-          break;
-        default:
-          throw new Error(`Got unknown object type ${type}`);
-      }
-    });
+    );
 
     messageHandler.on("DocProgress", data => {
       if (this.destroyed) {
@@ -3357,6 +3417,7 @@ class InternalRenderTask {
     pageColors = null,
     enableHWA = false,
     operationsFilter = null,
+    stats = null,
   }) {
     this.callback = callback;
     this.params = params;
@@ -3390,6 +3451,7 @@ class InternalRenderTask {
     this._dependencyTracker = params.dependencyTracker;
     this._imagesTracker = params.imagesTracker;
     this._operationsFilter = operationsFilter;
+    this._stats = stats;
   }
 
   get completed() {
@@ -3403,6 +3465,7 @@ class InternalRenderTask {
     if (this.cancelled) {
       return;
     }
+    const start = this._stats ? Date.now() : 0;
     if (this._canvas) {
       if (InternalRenderTask.#canvasInUse.has(this._canvas)) {
         throw new Error(
@@ -3446,7 +3509,8 @@ class InternalRenderTask {
       this.annotationCanvasMap,
       this.pageColors,
       dependencyTracker,
-      imagesTracker
+      imagesTracker,
+      this._stats
     );
     this.gfx.beginDrawing({
       transform,
@@ -3456,10 +3520,11 @@ class InternalRenderTask {
     });
     this.operatorListIdx = 0;
     this.graphicsReady = true;
+    this._stats?.add("Graphics Init", start);
     this.graphicsReadyCallback?.();
   }
 
-  cancel(error = null, extraDelay = 0) {
+  cancel(error = null, extraDelay = 0, abortOperatorList = false) {
     this.running = false;
     this.cancelled = true;
     this.gfx?.endDrawing();
@@ -3471,7 +3536,8 @@ class InternalRenderTask {
 
     error ||= new RenderingCancelledException(
       `Rendering cancelled, page ${this._pageIndex + 1}`,
-      extraDelay
+      extraDelay,
+      abortOperatorList
     );
     this.callback(error);
 
@@ -3500,20 +3566,31 @@ class InternalRenderTask {
       return;
     }
     if (this.task.onContinue) {
-      this.task.onContinue(this._scheduleNextBound);
+      const start = this._stats ? Date.now() : 0;
+      this.task.onContinue(() => {
+        this._stats?.add("RenderTask Continue Wait", start);
+        this._scheduleNext();
+      });
     } else {
       this._scheduleNext();
     }
   }
 
   _scheduleNext() {
+    const start = this._stats ? Date.now() : 0;
     if (this._useRequestAnimationFrame) {
       this.#rAF = window.requestAnimationFrame(() => {
         this.#rAF = null;
+        this._stats?.add("RenderTask Schedule Wait", start);
         this._nextBound().catch(this._cancelBound);
       });
     } else {
-      Promise.resolve().then(this._nextBound).catch(this._cancelBound);
+      Promise.resolve()
+        .then(() => {
+          this._stats?.add("RenderTask Schedule Wait", start);
+          return this._nextBound();
+        })
+        .catch(this._cancelBound);
     }
   }
 
@@ -3521,6 +3598,8 @@ class InternalRenderTask {
     if (this.cancelled) {
       return;
     }
+    const startIdx = this.operatorListIdx;
+    const start = this._stats ? Date.now() : 0;
     this.operatorListIdx = this.gfx.executeOperatorList(
       this.operatorList,
       this.operatorListIdx,
@@ -3528,10 +3607,18 @@ class InternalRenderTask {
       this.stepper,
       this._operationsFilter
     );
+    const executionInfo = this.gfx.executionInfo;
+    this._stats?.add(
+      `E: slice ${startIdx}-${this.operatorListIdx} ` +
+        `(${executionInfo?.reason || "unknown"})`,
+      start
+    );
     if (this.operatorListIdx === this.operatorList.argsArray.length) {
       this.running = false;
       if (this.operatorList.lastChunk) {
+        const endDrawingStart = this._stats ? Date.now() : 0;
         this.gfx.endDrawing();
+        this._stats?.add("Canvas EndDrawing", endDrawingStart);
         InternalRenderTask.#canvasInUse.delete(this._canvas);
         this.callback();
       }

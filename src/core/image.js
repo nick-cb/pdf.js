@@ -90,15 +90,24 @@ class PDFImage {
     const dict = image.dict;
 
     const filter = dict.get("F", "Filter");
+    const filterNames = [];
     let filterName;
     if (filter instanceof Name) {
       filterName = filter.name;
+      filterNames.push(filterName);
     } else if (Array.isArray(filter)) {
       const filterZero = xref.fetchIfRef(filter[0]);
       if (filterZero instanceof Name) {
         filterName = filterZero.name;
       }
+      for (const entry of filter) {
+        const resolvedFilter = xref.fetchIfRef(entry);
+        if (resolvedFilter instanceof Name) {
+          filterNames.push(resolvedFilter.name);
+        }
+      }
     }
+    this.filterNames = filterNames;
     switch (filterName) {
       case "JPXDecode":
         ({
@@ -709,7 +718,24 @@ class PDFImage {
     );
   }
 
-  async createImageData(forceRGBA = false, isOffscreenCanvasSupported = false) {
+  async createImageData(
+    forceRGBA = false,
+    isOffscreenCanvasSupported = false,
+    profile = null
+  ) {
+    const startProfile = () =>
+      typeof performance !== "undefined" ? performance.now() : Date.now();
+    const addProfile = (name, start, end = startProfile()) => {
+      profile?.(name, start, end);
+    };
+    if (profile) {
+      const filterTime = startProfile();
+      addProfile(
+        `filter: ${this.filterNames.join(" + ") || "none"}`,
+        filterTime,
+        filterTime
+      );
+    }
     const drawWidth = this.drawWidth;
     const drawHeight = this.drawHeight;
     const imgData = {
@@ -734,12 +760,18 @@ class PDFImage {
 
     if (!this.smask && !this.mask && this.colorSpace.name === "DeviceRGBA") {
       imgData.kind = ImageKind.RGBA_32BPP;
+      let stepStart = startProfile();
       const imgArray = (imgData.data = await this.getImageBytes(
         originalHeight * originalWidth * 4,
-        { internal: isOffscreenCanvasSupported && mustBeResized }
+        {
+          internal: isOffscreenCanvasSupported && mustBeResized,
+          profile,
+        }
       ));
+      addProfile("get rgba bytes", stepStart);
 
       if (this.jpxPremultiplied) {
+        stepStart = startProfile();
         const matteRgb = this.preblendMatte;
         PDFImage.#undoPreblend(
           imgArray,
@@ -748,18 +780,25 @@ class PDFImage {
           matteRgb?.[1] ?? 0,
           matteRgb?.[2] ?? 0
         );
+        addProfile("undo rgba preblend", stepStart);
       }
 
       if (isOffscreenCanvasSupported) {
         if (!mustBeResized) {
-          return this.createBitmap(
+          stepStart = startProfile();
+          const bitmap = this.createBitmap(
             ImageKind.RGBA_32BPP,
             drawWidth,
             drawHeight,
             imgArray
           );
+          addProfile("create bitmap", stepStart);
+          return bitmap;
         }
-        return ImageResizer.createImage(imgData, false);
+        stepStart = startProfile();
+        const image = ImageResizer.createImage(imgData, false);
+        addProfile("resize image", stepStart);
+        return image;
       }
 
       return imgData;
@@ -788,16 +827,26 @@ class PDFImage {
         drawWidth === originalWidth &&
         drawHeight === originalHeight
       ) {
-        const image = await this.#getImage(originalWidth, originalHeight);
+        let stepStart = startProfile();
+        const image = await this.#getImage(
+          originalWidth,
+          originalHeight,
+          profile
+        );
+        addProfile("get cached image", stepStart);
         if (image) {
           return image;
         }
+        stepStart = startProfile();
         const data = await this.getImageBytes(originalHeight * rowBytes, {
           internal: isOffscreenCanvasSupported && mustBeResized,
+          profile,
         });
+        addProfile("get compact bytes", stepStart);
         if (isOffscreenCanvasSupported) {
           if (mustBeResized) {
-            return ImageResizer.createImage(
+            stepStart = startProfile();
+            const resizedImage = ImageResizer.createImage(
               {
                 data,
                 kind,
@@ -807,8 +856,18 @@ class PDFImage {
               },
               this.needsDecode
             );
+            addProfile("resize compact image", stepStart);
+            return resizedImage;
           }
-          return this.createBitmap(kind, originalWidth, originalHeight, data);
+          stepStart = startProfile();
+          const bitmap = this.createBitmap(
+            kind,
+            originalWidth,
+            originalHeight,
+            data
+          );
+          addProfile("create compact bitmap", stepStart);
+          return bitmap;
         }
         imgData.kind = kind;
         imgData.data = data;
@@ -819,10 +878,12 @@ class PDFImage {
             kind === ImageKind.GRAYSCALE_1BPP,
             "PDFImage.createImageData: The image must be grayscale."
           );
+          stepStart = startProfile();
           const buffer = imgData.data;
           for (let i = 0, ii = buffer.length; i < ii; i++) {
             buffer[i] ^= 0xff;
           }
+          addProfile("decode compact grayscale", stepStart);
         }
         return imgData;
       }
@@ -838,7 +899,9 @@ class PDFImage {
         if (isHandled) {
           if (isOffscreenCanvasSupported) {
             // Try ImageDecoder before the pixel-buffer fallback.
-            const image = await this.#getImage(drawWidth, drawHeight);
+            const stepStart = startProfile();
+            const image = await this.#getImage(drawWidth, drawHeight, profile);
+            addProfile("get cached jpeg image", stepStart);
             if (image) {
               return image;
             }
@@ -855,45 +918,62 @@ class PDFImage {
                 imageLength = (imageLength / 3) * 4;
                 break;
             }
+            let stepStart = startProfile();
             const rgba = await this.getImageBytes(imageLength, {
               drawWidth,
               drawHeight,
               forceRGBA: true,
               internal: true,
+              profile,
             });
-            return this.createBitmap(
+            addProfile("get jpeg rgba bytes", stepStart);
+            stepStart = startProfile();
+            const bitmap = this.createBitmap(
               ImageKind.RGBA_32BPP,
               drawWidth,
               drawHeight,
               rgba
             );
+            addProfile("create jpeg bitmap", stepStart);
+            return bitmap;
           }
           if (this.colorSpace.name === "DeviceGray") {
             imageLength *= 3;
           }
           imgData.kind = ImageKind.RGB_24BPP;
+          let stepStart = startProfile();
           imgData.data = await this.getImageBytes(imageLength, {
             drawWidth,
             drawHeight,
             forceRGB: true,
             internal: mustBeResized,
+            profile,
           });
+          addProfile("get jpeg rgb bytes", stepStart);
           if (mustBeResized) {
-            return ImageResizer.createImage(imgData);
+            stepStart = startProfile();
+            const image = ImageResizer.createImage(imgData);
+            addProfile("resize jpeg image", stepStart);
+            return image;
           }
           return imgData;
         }
       }
     }
 
+    let stepStart = startProfile();
     const imgArray = await this.getImageBytes(originalHeight * rowBytes, {
       internal: true,
+      profile,
     });
+    addProfile("get raw bytes", stepStart);
     // imgArray can be incomplete (e.g. after CCITT fax encoding).
     const actualHeight =
       0 | (((imgArray.length / rowBytes) * drawHeight) / originalHeight);
 
+    stepStart = startProfile();
     const comps = this.getComponents(imgArray);
+    addProfile("unpack components", stepStart);
 
     // If opacity data is present, use RGBA_32BPP form. Otherwise, use the
     // more compact RGB_24BPP form if allowable.
@@ -901,10 +981,12 @@ class PDFImage {
 
     let canvas, ctx, canvasImgData, data;
     if (isOffscreenCanvasSupported && !mustBeResized) {
+      stepStart = startProfile();
       canvas = new OffscreenCanvas(drawWidth, drawHeight);
       ctx = canvas.getContext("2d");
       canvasImgData = ctx.createImageData(drawWidth, drawHeight);
       data = canvasImgData.data;
+      addProfile("create offscreen buffer", stepStart);
     }
 
     imgData.kind = ImageKind.RGBA_32BPP;
@@ -929,12 +1011,17 @@ class PDFImage {
       maybeUndoPreblend = true;
 
       // Color key masking (opacity) must be performed before decoding.
+      stepStart = startProfile();
       await this.fillOpacity(data, drawWidth, drawHeight, actualHeight, comps);
+      addProfile("fill opacity", stepStart);
     }
 
     if (this.needsDecode) {
+      stepStart = startProfile();
       this.decodeBuffer(comps);
+      addProfile("decode components", stepStart);
     }
+    stepStart = startProfile();
     this.colorSpace.fillRgb(
       data,
       originalWidth,
@@ -946,13 +1033,18 @@ class PDFImage {
       comps,
       alpha01
     );
+    addProfile("color conversion", stepStart);
     if (maybeUndoPreblend) {
+      stepStart = startProfile();
       this.undoPreblend(data, drawWidth, actualHeight);
+      addProfile("undo preblend", stepStart);
     }
 
     if (isOffscreenCanvasSupported && !mustBeResized) {
+      stepStart = startProfile();
       ctx.putImageData(canvasImgData, 0, 0);
       const bitmap = canvas.transferToImageBitmap();
+      addProfile("transfer bitmap", stepStart);
 
       return {
         data: null,
@@ -965,7 +1057,10 @@ class PDFImage {
 
     imgData.data = data;
     if (mustBeResized) {
-      return ImageResizer.createImage(imgData);
+      stepStart = startProfile();
+      const image = ImageResizer.createImage(imgData);
+      addProfile("resize image", stepStart);
+      return image;
     }
     return imgData;
   }
@@ -1134,8 +1229,12 @@ class PDFImage {
     };
   }
 
-  async #getImage(width, height) {
-    const bitmap = await this.image.getTransferableImage(width, height);
+  async #getImage(width, height, profile = null) {
+    const bitmap = await this.image.getTransferableImage(
+      width,
+      height,
+      profile
+    );
     if (!bitmap) {
       return null;
     }
@@ -1157,6 +1256,7 @@ class PDFImage {
       forceRGBA = false,
       forceRGB = false,
       internal = false,
+      profile = null,
     }
   ) {
     this.image.reset();
@@ -1164,10 +1264,32 @@ class PDFImage {
     this.image.drawHeight = drawHeight || this.height;
     this.image.forceRGBA = !!forceRGBA;
     this.image.forceRGB = !!forceRGB;
-    const imageBytes = await this.image.getImageData(
-      length,
-      this.jpxDecoderOptions
-    );
+    let decoderReported = false;
+    const start =
+      typeof performance !== "undefined" ? performance.now() : Date.now();
+    const decoderOptions = {
+      ...this.jpxDecoderOptions,
+      profile: (name, profileStart, profileEnd) => {
+        decoderReported = true;
+        profile?.(name, profileStart, profileEnd);
+      },
+    };
+    let imageBytes, succeeded;
+    try {
+      imageBytes = await this.image.getImageData(length, decoderOptions);
+      succeeded = true;
+    } finally {
+      if (profile && !decoderReported) {
+        const decoder = `${this.filterNames.join(" + ") || "unfiltered"} / JavaScript`;
+        profile(
+          succeeded
+            ? `decoder: ${decoder}`
+            : `decoder attempt: ${decoder} (failed)`,
+          start,
+          typeof performance !== "undefined" ? performance.now() : Date.now()
+        );
+      }
+    }
 
     if (internal || this.image instanceof DecodeStream) {
       // Internal callers never transfer/return raw bytes out of the worker,

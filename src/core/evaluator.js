@@ -1930,16 +1930,6 @@ class PartialEvaluator {
                   }
                   throw reason;
                 })
-                .catch(function (reason) {
-                  if (reason instanceof AbortException) {
-                    return;
-                  }
-                  if (self.options.ignoreErrors) {
-                    warn(`getOperatorList - ignoring XObject: "${reason}".`);
-                    return;
-                  }
-                  throw reason;
-                })
                 .finally(() => {
                   addOperatorProfile(fn, operationStart, name);
                 })

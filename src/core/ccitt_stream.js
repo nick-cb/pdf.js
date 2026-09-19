@@ -54,7 +54,7 @@ class CCITTFaxStream extends DecodeStream {
     return true;
   }
 
-  async decodeImage(bytes, length, _decoderOptions) {
+  async decodeImage(bytes, length, decoderOptions) {
     if (this.eof) {
       return this.buffer;
     }
@@ -62,13 +62,28 @@ class CCITTFaxStream extends DecodeStream {
       ? (await this.stream.asyncGetBytes()) || this.bytes
       : this.bytes;
 
-    this.buffer = await JBig2CCITTFaxImage.instance.decode(
-      bytes,
-      this.dict.get("W", "Width"),
-      this.dict.get("H", "Height"),
-      null,
-      this.params
-    );
+    const decoder = JBig2CCITTFaxImage.instance;
+    const start =
+      typeof performance !== "undefined" ? performance.now() : Date.now();
+    let succeeded = false;
+    try {
+      this.buffer = await decoder.decode(
+        bytes,
+        this.dict.get("W", "Width"),
+        this.dict.get("H", "Height"),
+        null,
+        this.params
+      );
+      succeeded = true;
+    } finally {
+      decoderOptions?.profile?.(
+        succeeded
+          ? `decoder: CCITT Fax / ${decoder.decoderType}`
+          : `decoder attempt: CCITT Fax / ${decoder.decoderType} (failed)`,
+        start,
+        typeof performance !== "undefined" ? performance.now() : Date.now()
+      );
+    }
     this.bufferLength = this.buffer.length;
     this.eof = true;
 

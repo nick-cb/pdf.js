@@ -66,8 +66,17 @@ const EXECUTION_STEPS = 10;
 
 const FULL_CHUNK_HEIGHT = 16;
 
+// Number of rows a whole-canvas pixel pass (e.g. the transfer-map fallback)
+// handles between two yield points.
+const PIXEL_CHUNK_HEIGHT = 64;
+
 // Used to get some coordinates.
 const XY = new Float32Array(2);
+
+const OPS_NAMES = new Map();
+for (const [name, op] of Object.entries(OPS)) {
+  OPS_NAMES.set(op, name);
+}
 
 /**
  * Overrides certain methods on a 2d ctx so that when they are called they
@@ -317,7 +326,19 @@ class CanvasExtraState {
   }
 }
 
-function putBinaryImageData(ctx, imgData) {
+// Runs a resumable step generator straight through, ignoring its yield
+// points, and returns its result.
+function drain(steps) {
+  let result;
+  while (!(result = steps.next()).done) {
+    // Nothing to do in between.
+  }
+  return result.value;
+}
+
+// Yields after every chunk: whatever has been written is already on the
+// destination canvas, so the caller may hand the thread back in between.
+function* putBinaryImageDataSteps(ctx, imgData) {
   // Put the image data to the canvas in chunks, rather than putting the
   // whole image at once.  This saves JS memory, because the ImageData object
   // is smaller. It also possibly saves C++ memory within the implementation
@@ -354,6 +375,9 @@ function putBinaryImageData(ctx, imgData) {
       }));
 
       ctx.putImageData(chunkImgData, 0, i * FULL_CHUNK_HEIGHT);
+      if (i + 1 < totalChunks) {
+        yield;
+      }
     }
   } else if (kind === ImageKind.RGBA_32BPP) {
     // RGBA, 32-bits per pixel.
@@ -365,6 +389,9 @@ function putBinaryImageData(ctx, imgData) {
 
       ctx.putImageData(chunkImgData, 0, j);
       j += FULL_CHUNK_HEIGHT;
+      if (i + 1 < totalChunks) {
+        yield;
+      }
     }
     if (i < totalChunks) {
       elemsInThisChunk = width * partialChunkHeight * 4;
@@ -384,13 +411,16 @@ function putBinaryImageData(ctx, imgData) {
       }));
 
       ctx.putImageData(chunkImgData, 0, i * FULL_CHUNK_HEIGHT);
+      if (i + 1 < totalChunks) {
+        yield;
+      }
     }
   } else {
     throw new Error(`bad image kind: ${kind}`);
   }
 }
 
-function putBinaryImageMask(ctx, imgData) {
+function* putBinaryImageMaskSteps(ctx, imgData) {
   if (imgData.bitmap) {
     // The bitmap has been created in the worker.
     ctx.drawImage(imgData.bitmap, 0, 0);
@@ -421,6 +451,9 @@ function putBinaryImageMask(ctx, imgData) {
     }));
 
     ctx.putImageData(chunkImgData, 0, i * FULL_CHUNK_HEIGHT);
+    if (i + 1 < totalChunks) {
+      yield;
+    }
   }
 }
 
@@ -520,10 +553,22 @@ class TransferMapsFallback {
   }
 
   applyToCanvas(ctx) {
+    drain(this.applyToCanvasSteps(ctx));
+  }
+
+  // Banded so a full-page transfer-map pass isn't one uninterruptible
+  // read-modify-write of the whole canvas.
+  *applyToCanvasSteps(ctx) {
     const { width, height } = ctx.canvas;
-    const imgData = ctx.getImageData(0, 0, width, height);
-    this.applyToImageData(imgData);
-    ctx.putImageData(imgData, 0, 0);
+    for (let y = 0; y < height; y += PIXEL_CHUNK_HEIGHT) {
+      const bandHeight = Math.min(PIXEL_CHUNK_HEIGHT, height - y);
+      const imgData = ctx.getImageData(0, y, width, bandHeight);
+      this.applyToImageData(imgData);
+      ctx.putImageData(imgData, 0, y);
+      if (y + bandHeight < height) {
+        yield;
+      }
+    }
   }
 }
 
@@ -597,6 +642,16 @@ class CanvasGraphics {
   // restore on exit), pixel offsets, and pooled scratch entries.
   #groupStackMeta = [];
 
+  // Absolute timestamp the current `executeOperatorList` slice must not run
+  // past. 0 means an operator may not interrupt itself: no continue callback,
+  // or a nested operator list (Type3 glyph, tiling pattern).
+  #yieldDeadline = 0;
+
+  // Resume state of an operator that interrupted itself mid-way, as
+  // `{ idx, resume, dispose }`. `executeOperatorList` re-enters it instead of
+  // running the operator at `idx` again.
+  #suspendedOp = null;
+
   constructor(
     canvasCtx,
     commonObjs,
@@ -607,7 +662,8 @@ class CanvasGraphics {
     annotationCanvasMap,
     pageColors,
     dependencyTracker,
-    imagesTracker
+    imagesTracker,
+    stats = null
   ) {
     this.ctx = canvasCtx;
     this.current = new CanvasExtraState(
@@ -662,6 +718,41 @@ class CanvasGraphics {
 
     this.dependencyTracker = dependencyTracker ?? null;
     this.imagesTracker = imagesTracker ?? null;
+    this._stats = stats;
+    this.executionInfo = null;
+  }
+
+  /**
+   * Whether the current slice is out of time and the graphics state may be
+   * left mid-operator. An active soft mask composes-and-clears the scratch
+   * canvas once per operator and a knockout element is a single unit for
+   * compositing, so neither may straddle a yield.
+   */
+  #shouldYield() {
+    return (
+      this.#yieldDeadline !== 0 &&
+      this.current.activeSMask === null &&
+      this.#knockoutElementDepth === 0 &&
+      Date.now() > this.#yieldDeadline
+    );
+  }
+
+  /**
+   * Runs a resumable operator, stopping at one of its yield points once the
+   * slice is over. Nothing else may touch the canvas between two slices; the
+   * generator is left holding whatever state the next one continues from.
+   */
+  #runResumable(opIdx, steps) {
+    while (!steps.next().done) {
+      if (this.#shouldYield()) {
+        this.#suspendedOp = {
+          idx: opIdx,
+          resume: () => this.#runResumable(opIdx, steps),
+          dispose: () => steps.return(),
+        };
+        return;
+      }
+    }
   }
 
   getObject(opIdx, data, fallback = null) {
@@ -725,20 +816,62 @@ class CanvasGraphics {
     stepper,
     operationsFilter
   ) {
-    const argsArray = operatorList.argsArray;
-    const fnArray = operatorList.fnArray;
-    let i = executionStartIdx || 0;
-    const argsArrayLen = argsArray.length;
+    const i = executionStartIdx || 0;
+    const initialIdx = i;
+    const argsArrayLen = operatorList.argsArray.length;
+    this.executionInfo = {
+      reason: "complete",
+      startIdx: initialIdx,
+      endIdx: i,
+    };
 
     // Sometimes the OperatorList to execute is empty.
     if (argsArrayLen === i) {
+      this.executionInfo.reason = "empty";
       return i;
     }
 
-    const chunkOperations =
-      argsArrayLen - i > EXECUTION_STEPS &&
-      typeof continueCallback === "function";
-    const endTime = chunkOperations ? Date.now() + EXECUTION_TIME : 0;
+    const canInterrupt = typeof continueCallback === "function";
+    const chunkOperations = argsArrayLen - i > EXECUTION_STEPS && canInterrupt;
+    // A single operator may interrupt itself whenever we can be called back,
+    // even on an operator list too short to chunk between operators.
+    const endTime = canInterrupt ? Date.now() + EXECUTION_TIME : 0;
+
+    // Nested operator lists get no callback of their own, so they must run to
+    // completion inside the operator that invoked them.
+    const outerDeadline = this.#yieldDeadline;
+    this.#yieldDeadline = endTime;
+    try {
+      return this.#executeOperatorListLoop(
+        operatorList,
+        i,
+        initialIdx,
+        continueCallback,
+        stepper,
+        operationsFilter,
+        chunkOperations,
+        endTime
+      );
+    } finally {
+      this.#yieldDeadline = outerDeadline;
+    }
+  }
+
+  #executeOperatorListLoop(
+    operatorList,
+    i,
+    initialIdx,
+    continueCallback,
+    stepper,
+    operationsFilter,
+    chunkOperations,
+    endTime
+  ) {
+    const argsArray = operatorList.argsArray;
+    const fnArray = operatorList.fnArray;
+    const argsArrayLen = argsArray.length;
+    const now = () =>
+      typeof performance !== "undefined" ? performance.now() : Date.now();
     let steps = 0;
 
     const commonObjs = this.commonObjs;
@@ -748,6 +881,11 @@ class CanvasGraphics {
     while (true) {
       if (stepper !== undefined) {
         if (i === stepper.nextBreakPoint) {
+          this.executionInfo = {
+            reason: "stepper",
+            startIdx: initialIdx,
+            endIdx: i,
+          };
           stepper.breakIt(i, continueCallback);
           return i;
         }
@@ -764,11 +902,27 @@ class CanvasGraphics {
         // TODO: There is a `undefined` coming from somewhere.
         fnArgs = argsArray[i] ?? null;
 
+        const opStart = this._stats ? now() : 0;
         if (fnId !== OPS.dependency) {
-          if (fnArgs === null) {
+          const suspended = this.#suspendedOp;
+          if (suspended !== null && suspended.idx === i) {
+            this.#suspendedOp = null;
+            suspended.resume();
+          } else if (fnArgs === null) {
             this[fnId](i);
           } else {
             this[fnId](i, ...fnArgs);
+          }
+          if (this.#suspendedOp !== null) {
+            // The operator stopped part-way through; come back to the same
+            // index once the caller has let the event loop breathe.
+            this.executionInfo = {
+              reason: "time-slice",
+              startIdx: initialIdx,
+              endIdx: i,
+            };
+            continueCallback();
+            return i;
           }
         } else {
           for (const depObjId of fnArgs) {
@@ -778,17 +932,43 @@ class CanvasGraphics {
             // If the promise isn't resolved yet, add the continueCallback
             // to the promise and bail out.
             if (!objsPool.has(depObjId)) {
-              objsPool.get(depObjId, continueCallback);
+              if (this._stats && continueCallback) {
+                const waitStart = Date.now();
+                objsPool.get(depObjId, () => {
+                  this._stats.add(
+                    `E: dependency wait ${depObjId} at operator ${i}`,
+                    waitStart
+                  );
+                  continueCallback();
+                });
+              } else {
+                objsPool.get(depObjId, continueCallback);
+              }
+              this.executionInfo = {
+                reason: `dependency ${depObjId}`,
+                startIdx: initialIdx,
+                endIdx: i,
+              };
               return i;
             }
           }
         }
+        this._stats?.add(
+          `E: op ${i} ${OPS_NAMES.get(fnId) || fnId}`,
+          opStart,
+          now()
+        );
       }
 
       i++;
 
       // If the entire operatorList was executed, stop as were done.
       if (i === argsArrayLen) {
+        this.executionInfo = {
+          reason: "complete",
+          startIdx: initialIdx,
+          endIdx: i,
+        };
         return i;
       }
 
@@ -796,6 +976,11 @@ class CanvasGraphics {
       // `continueCallback` is specified, interrupt the execution.
       if (chunkOperations && ++steps > EXECUTION_STEPS) {
         if (Date.now() > endTime) {
+          this.executionInfo = {
+            reason: "time-slice",
+            startIdx: initialIdx,
+            endIdx: i,
+          };
           continueCallback();
           return i;
         }
@@ -829,6 +1014,11 @@ class CanvasGraphics {
   }
 
   endDrawing() {
+    // Rendering may have been cancelled with an operator half-done; let it
+    // release whatever it was holding.
+    this.#suspendedOp?.dispose();
+    this.#suspendedOp = null;
+
     this.#restoreInitialState();
 
     // Destroy all smask group canvases now that rendering is complete.
@@ -892,6 +1082,12 @@ class CanvasGraphics {
   }
 
   _scaleImage(img, inverseTransform) {
+    return drain(this.#scaleImageSteps(img, inverseTransform));
+  }
+
+  // Yields between halving steps. Each step is a full drawImage of the
+  // previous one, so a large downscale is several frames of work.
+  *#scaleImageSteps(img, inverseTransform) {
     // Vertical or horizontal scaling shall not be more than 2 to not lose the
     // pixels during drawImage operation, painting on the temporary canvas(es)
     // that are twice smaller in size.
@@ -965,7 +1161,8 @@ class CanvasGraphics {
       paintHeight = height;
     let source = img;
 
-    for (const { newWidth, newHeight } of scaleSteps) {
+    for (let step = 0, ii = scaleSteps.length; step < ii; step++) {
+      const { newWidth, newHeight } = scaleSteps[step];
       this.canvasFactory.reset(writeEntry, newWidth, newHeight);
       writeEntry.context.drawImage(
         source,
@@ -982,6 +1179,9 @@ class CanvasGraphics {
       source = readEntry.canvas;
       paintWidth = newWidth;
       paintHeight = newHeight;
+      if (step + 1 < ii) {
+        yield;
+      }
     }
 
     // writeEntry is now the stale buffer; destroy it.
@@ -995,6 +1195,12 @@ class CanvasGraphics {
   }
 
   _createMaskCanvas(opIdx, img) {
+    return drain(this.#createMaskCanvasSteps(opIdx, img));
+  }
+
+  // Yields between the mask's stages. Nothing here touches the page canvas
+  // until the returned canvas is drawn by the caller.
+  *#createMaskCanvasSteps(opIdx, img) {
     const ctx = this.ctx;
     const { width, height } = img;
     const isPatternFill = this.current.patternFill;
@@ -1044,7 +1250,8 @@ class CanvasGraphics {
 
     if (!scaled) {
       maskCanvas = this.canvasFactory.create(width, height);
-      putBinaryImageMask(maskCanvas.context, img);
+      yield* putBinaryImageMaskSteps(maskCanvas.context, img);
+      yield;
     }
 
     // Create the mask canvas at the size it will be drawn at and also set
@@ -1081,7 +1288,7 @@ class CanvasGraphics {
     let scaledEntry = null;
     if (!scaled) {
       // Pre-scale if needed to improve image smoothing.
-      const scaleResult = this._scaleImage(
+      const scaleResult = yield* this.#scaleImageSteps(
         maskCanvas.canvas,
         getCurrentTransformInverse(fillCtx)
       );
@@ -1103,6 +1310,8 @@ class CanvasGraphics {
       getCurrentTransform(fillCtx),
       img.interpolate
     );
+
+    yield;
 
     drawImageAtIntegerCoords(
       fillCtx,
@@ -1136,6 +1345,8 @@ class CanvasGraphics {
     fillCtx.fillStyle = isPatternFill
       ? fillColor.getPattern(ctx, this, inverse, PathType.FILL, opIdx)
       : fillColor;
+
+    yield;
 
     fillCtx.fillRect(0, 0, width, height);
 
@@ -3115,7 +3326,9 @@ class CanvasGraphics {
                   renderingOpIdx,
                   /* ignoreBBoxes */ true
                 )
-              : null
+              : null,
+            null,
+            this._stats
           ),
       };
       pattern = new TilingPattern(
@@ -3868,6 +4081,10 @@ class CanvasGraphics {
   }
 
   paintImageMaskXObject(opIdx, img) {
+    this.#runResumable(opIdx, this.#paintImageMaskXObjectSteps(opIdx, img));
+  }
+
+  *#paintImageMaskXObjectSteps(opIdx, img) {
     if (!this.contentVisible) {
       return;
     }
@@ -3878,7 +4095,7 @@ class CanvasGraphics {
 
     const started = this.#beginKnockoutElement(this.current.fillAlpha);
     const ctx = this.ctx;
-    const mask = this._createMaskCanvas(opIdx, img);
+    const mask = yield* this.#createMaskCanvasSteps(opIdx, img);
     const maskCanvas = mask.canvas;
 
     ctx.save();
@@ -3914,6 +4131,29 @@ class CanvasGraphics {
     scaleY,
     positions
   ) {
+    this.#runResumable(
+      opIdx,
+      this.#paintImageMaskXObjectRepeatSteps(
+        opIdx,
+        img,
+        scaleX,
+        skewX,
+        skewY,
+        scaleY,
+        positions
+      )
+    );
+  }
+
+  *#paintImageMaskXObjectRepeatSteps(
+    opIdx,
+    img,
+    scaleX,
+    skewX,
+    skewY,
+    scaleY,
+    positions
+  ) {
     if (!this.contentVisible) {
       return;
     }
@@ -3923,44 +4163,53 @@ class CanvasGraphics {
     const started = this.#beginKnockoutElement(this.current.fillAlpha);
     const ctx = this.ctx;
     ctx.save();
-    const currentTransform = getCurrentTransform(ctx);
-    ctx.transform(scaleX, skewX, skewY, scaleY, 0, 0);
-    const mask = this._createMaskCanvas(opIdx, img);
+    // The save and the mask canvas straddle the yield points below, so they
+    // are released here rather than on the happy path only.
+    let mask = null;
+    try {
+      const currentTransform = getCurrentTransform(ctx);
+      ctx.transform(scaleX, skewX, skewY, scaleY, 0, 0);
+      mask = yield* this.#createMaskCanvasSteps(opIdx, img);
 
-    ctx.setTransform(
-      1,
-      0,
-      0,
-      1,
-      mask.offsetX - currentTransform[4],
-      mask.offsetY - currentTransform[5]
-    );
-    this.dependencyTracker?.resetBBox(opIdx);
-    for (let i = 0, ii = positions.length; i < ii; i += 2) {
-      const trans = Util.transform(currentTransform, [
-        scaleX,
-        skewX,
-        skewY,
-        scaleY,
-        positions[i],
-        positions[i + 1],
-      ]);
-
-      // Here we want to apply the transform at the origin,
-      // hence no additional computation is necessary.
-      ctx.drawImage(mask.canvas, trans[4], trans[5]);
-      this.dependencyTracker?.recordBBox(
-        opIdx,
-        this.ctx,
-        trans[4],
-        trans[4] + mask.canvas.width,
-        trans[5],
-        trans[5] + mask.canvas.height
+      ctx.setTransform(
+        1,
+        0,
+        0,
+        1,
+        mask.offsetX - currentTransform[4],
+        mask.offsetY - currentTransform[5]
       );
-    }
-    ctx.restore();
-    if (mask.canvasEntry) {
-      this.canvasFactory.destroy(mask.canvasEntry);
+      this.dependencyTracker?.resetBBox(opIdx);
+      for (let i = 0, ii = positions.length; i < ii; i += 2) {
+        const trans = Util.transform(currentTransform, [
+          scaleX,
+          skewX,
+          skewY,
+          scaleY,
+          positions[i],
+          positions[i + 1],
+        ]);
+
+        // Here we want to apply the transform at the origin,
+        // hence no additional computation is necessary.
+        ctx.drawImage(mask.canvas, trans[4], trans[5]);
+        this.dependencyTracker?.recordBBox(
+          opIdx,
+          this.ctx,
+          trans[4],
+          trans[4] + mask.canvas.width,
+          trans[5],
+          trans[5] + mask.canvas.height
+        );
+        if (i + 2 < ii) {
+          yield;
+        }
+      }
+    } finally {
+      ctx.restore();
+      if (mask?.canvasEntry) {
+        this.canvasFactory.destroy(mask.canvasEntry);
+      }
     }
     this.compose();
 
@@ -3969,6 +4218,13 @@ class CanvasGraphics {
   }
 
   paintImageMaskXObjectGroup(opIdx, images) {
+    this.#runResumable(
+      opIdx,
+      this.#paintImageMaskXObjectGroupSteps(opIdx, images)
+    );
+  }
+
+  *#paintImageMaskXObjectGroupSteps(opIdx, images) {
     if (!this.contentVisible) {
       return;
     }
@@ -3983,7 +4239,8 @@ class CanvasGraphics {
       ?.resetBBox(opIdx)
       .recordDependencies(opIdx, Dependencies.transformAndFill);
 
-    for (const image of images) {
+    for (let k = 0, kk = images.length; k < kk; k++) {
+      const image = images[k];
       const { data, width, height, transform } = image;
 
       const maskCanvas = this.canvasFactory.create(width, height);
@@ -3991,7 +4248,7 @@ class CanvasGraphics {
       maskCtx.save();
 
       const img = this.getObject(opIdx, data, image);
-      putBinaryImageMask(maskCtx, img);
+      yield* putBinaryImageMaskSteps(maskCtx, img);
 
       maskCtx.globalCompositeOperation = "source-in";
 
@@ -4027,6 +4284,9 @@ class CanvasGraphics {
 
       this.dependencyTracker?.recordBBox(opIdx, ctx, 0, width, 0, height);
       ctx.restore();
+      if (k + 1 < kk) {
+        yield;
+      }
     }
     this.compose();
     this.dependencyTracker?.recordOperation(opIdx);
@@ -4072,12 +4332,19 @@ class CanvasGraphics {
   }
 
   applyTransferMapsToCanvas(ctx) {
+    return drain(this.#applyTransferMapsToCanvasSteps(ctx));
+  }
+
+  *#applyTransferMapsToCanvasSteps(ctx) {
     if (this.current.transferMaps !== "none") {
       ctx.filter = this.current.transferMaps;
       ctx.drawImage(ctx.canvas, 0, 0);
       ctx.filter = "none";
     } else {
-      this.current.transferMapsFallback?.applyToCanvas(ctx);
+      const fallback = this.current.transferMapsFallback;
+      if (fallback) {
+        yield* fallback.applyToCanvasSteps(ctx);
+      }
     }
     return ctx.canvas;
   }
@@ -4099,6 +4366,13 @@ class CanvasGraphics {
   }
 
   paintInlineImageXObject(opIdx, imgData) {
+    this.#runResumable(
+      opIdx,
+      this.#paintInlineImageXObjectSteps(opIdx, imgData)
+    );
+  }
+
+  *#paintInlineImageXObjectSteps(opIdx, imgData) {
     if (!this.contentVisible) {
       return;
     }
@@ -4123,57 +4397,68 @@ class CanvasGraphics {
 
     let imgToPaint;
     let inlineImgCanvas = null;
-    if (imgData.bitmap) {
-      const result = this.applyTransferMapsToBitmap(imgData);
-      imgToPaint = result.img;
-      inlineImgCanvas = result.canvasEntry;
-    } else {
-      const tmpCanvas = this.canvasFactory.create(width, height);
-      putBinaryImageData(tmpCanvas.context, imgData);
-      imgToPaint = this.applyTransferMapsToCanvas(tmpCanvas.context);
-      inlineImgCanvas = tmpCanvas;
-    }
+    let scaled = null;
+    try {
+      if (imgData.bitmap) {
+        const result = this.applyTransferMapsToBitmap(imgData);
+        imgToPaint = result.img;
+        inlineImgCanvas = result.canvasEntry;
+      } else {
+        const tmpCanvas = this.canvasFactory.create(width, height);
+        inlineImgCanvas = tmpCanvas;
+        yield* putBinaryImageDataSteps(tmpCanvas.context, imgData);
+        yield;
+        imgToPaint = yield* this.#applyTransferMapsToCanvasSteps(
+          tmpCanvas.context
+        );
+      }
 
-    const scaled = this._scaleImage(
-      imgToPaint,
-      getCurrentTransformInverse(ctx)
-    );
-    ctx.imageSmoothingEnabled = getImageSmoothingEnabled(
-      getCurrentTransform(ctx),
-      imgData.interpolate
-    );
+      yield;
 
-    if (this.dependencyTracker) {
-      this.dependencyTracker
-        .resetBBox(opIdx)
-        .recordBBox(opIdx, ctx, 0, width, -height, 0)
-        .recordDependencies(opIdx, Dependencies.imageXObject)
-        .recordOperation(opIdx);
-      this.imagesTracker?.record(
-        ctx,
-        width,
-        height,
-        this.dependencyTracker.clipBox
+      scaled = yield* this.#scaleImageSteps(
+        imgToPaint,
+        getCurrentTransformInverse(ctx)
       );
-    }
+      ctx.imageSmoothingEnabled = getImageSmoothingEnabled(
+        getCurrentTransform(ctx),
+        imgData.interpolate
+      );
 
-    drawImageAtIntegerCoords(
-      ctx,
-      scaled.img,
-      0,
-      0,
-      scaled.paintWidth,
-      scaled.paintHeight,
-      0,
-      -height,
-      width,
-      height
-    );
-    if (scaled.tmpCanvas) {
-      this.canvasFactory.destroy(scaled.tmpCanvas);
-    }
-    if (inlineImgCanvas) {
-      this.canvasFactory.destroy(inlineImgCanvas);
+      if (this.dependencyTracker) {
+        this.dependencyTracker
+          .resetBBox(opIdx)
+          .recordBBox(opIdx, ctx, 0, width, -height, 0)
+          .recordDependencies(opIdx, Dependencies.imageXObject)
+          .recordOperation(opIdx);
+        this.imagesTracker?.record(
+          ctx,
+          width,
+          height,
+          this.dependencyTracker.clipBox
+        );
+      }
+
+      yield;
+
+      drawImageAtIntegerCoords(
+        ctx,
+        scaled.img,
+        0,
+        0,
+        scaled.paintWidth,
+        scaled.paintHeight,
+        0,
+        -height,
+        width,
+        height
+      );
+    } finally {
+      if (scaled?.tmpCanvas) {
+        this.canvasFactory.destroy(scaled.tmpCanvas);
+      }
+      if (inlineImgCanvas) {
+        this.canvasFactory.destroy(inlineImgCanvas);
+      }
     }
     this.compose();
     this.restore(opIdx);
@@ -4181,6 +4466,13 @@ class CanvasGraphics {
   }
 
   paintInlineImageXObjectGroup(opIdx, imgData, map) {
+    this.#runResumable(
+      opIdx,
+      this.#paintInlineImageXObjectGroupSteps(opIdx, imgData, map)
+    );
+  }
+
+  *#paintInlineImageXObjectGroupSteps(opIdx, imgData, map) {
     if (!this.contentVisible) {
       return;
     }
@@ -4199,14 +4491,18 @@ class CanvasGraphics {
       const h = imgData.height;
 
       const tmpCanvas = this.canvasFactory.create(w, h);
-      putBinaryImageData(tmpCanvas.context, imgData);
-      imgToPaint = this.applyTransferMapsToCanvas(tmpCanvas.context);
       inlineImgCanvas = tmpCanvas;
+      yield* putBinaryImageDataSteps(tmpCanvas.context, imgData);
+      yield;
+      imgToPaint = yield* this.#applyTransferMapsToCanvasSteps(
+        tmpCanvas.context
+      );
     }
 
     this.dependencyTracker?.resetBBox(opIdx);
 
-    for (const entry of map) {
+    for (let k = 0, kk = map.length; k < kk; k++) {
+      const entry = map[k];
       ctx.save();
       ctx.transform(...entry.transform);
       ctx.scale(1, -1);
@@ -4224,6 +4520,9 @@ class CanvasGraphics {
       );
       this.dependencyTracker?.recordBBox(opIdx, ctx, 0, 1, -1, 0);
       ctx.restore();
+      if (k + 1 < kk) {
+        yield;
+      }
     }
     if (inlineImgCanvas) {
       this.canvasFactory.destroy(inlineImgCanvas);

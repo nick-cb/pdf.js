@@ -949,12 +949,23 @@ class WorkerMessageHandler {
         { pageId, pageIndex, intent, cacheKey, annotationStorage, modifiedIds },
         sink
       ) {
-        pdfManager.getPage(pageId).then(function (page) {
-          const task = new WorkerTask(`GetOperatorList: page ${pageIndex}`);
-          startWorkerTask(task);
+        const task = new WorkerTask(`GetOperatorList: page ${pageIndex}`);
+        startWorkerTask(task);
+        sink.onCancel = () => task.terminate();
 
-          page
-            .getOperatorList({
+        (async () => {
+          try {
+            // Let cancellation of an obsolete queued render reach the worker
+            // before starting synchronous image decoding.
+            await new Promise(resolve => {
+              setTimeout(resolve, 0);
+            });
+            task.ensureNotTerminated();
+
+            const page = await pdfManager.getPage(pageId);
+            task.ensureNotTerminated();
+
+            await page.getOperatorList({
               handler,
               sink,
               task,
@@ -963,22 +974,17 @@ class WorkerMessageHandler {
               annotationStorage,
               modifiedIds,
               pageIndex,
-            })
-            .then(
-              () => {
-                sink.close();
-              },
-              reason => {
-                if (task.terminated) {
-                  return; // ignoring errors from the terminated thread
-                }
-                sink.error(reason);
-              }
-            )
-            .finally(() => {
-              finishWorkerTask(task);
             });
-        });
+            task.ensureNotTerminated();
+            sink.close();
+          } catch (reason) {
+            if (!task.terminated) {
+              sink.error(reason);
+            }
+          } finally {
+            finishWorkerTask(task);
+          }
+        })();
       }
     );
 

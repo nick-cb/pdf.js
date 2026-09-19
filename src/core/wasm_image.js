@@ -31,6 +31,8 @@ class WasmImage {
 
   #modulePromise = null;
 
+  _decoderType = null;
+
   _filename = null;
 
   _noWasmFilename = null;
@@ -53,6 +55,7 @@ class WasmImage {
   static cleanup() {
     for (const instance of WasmImage.#instances) {
       instance.#modulePromise = null;
+      instance._decoderType = null;
     }
   }
 
@@ -78,6 +81,9 @@ class WasmImage {
           import(`../${WasmImage.#wasmUrl}${this._noWasmFilename}`)
         : __raw_import__(`${WasmImage.#wasmUrl}${this._noWasmFilename}`));
       instance = mod.default();
+      if (instance) {
+        this._decoderType = "JavaScript fallback";
+      }
     } catch (ex) {
       warn(`#getJsModule: ${ex}`);
     }
@@ -122,12 +128,21 @@ class WasmImage {
           ImageDecoder({
             warn,
             instantiateWasm: this.#instantiateWasm.bind(this, resolve),
+          }).then(module => {
+            if (module && !this._decoderType) {
+              this._decoderType = "WASM";
+            }
+            return module;
           })
         );
       }
       this.#modulePromise = Promise.race(promises);
     }
     return this.#modulePromise;
+  }
+
+  get decoderType() {
+    return this._decoderType || "unknown";
   }
 
   async decode(bytes, _params) {
