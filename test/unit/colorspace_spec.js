@@ -68,6 +68,104 @@ describe("colorspace", function () {
     });
   });
 
+  describe("ColorSpace.fillRgb", function () {
+    it("should preserve alpha in the DeviceRGB fast path", function () {
+      const count = 65;
+      const src = new Uint8Array(count * 3);
+      const dest = new Uint8ClampedArray(count * 4);
+      for (let i = 0; i < count; i++) {
+        src[i * 3] = i;
+        src[i * 3 + 1] = i + 1;
+        src[i * 3 + 2] = i + 2;
+        dest[i * 4 + 3] = 255 - i;
+      }
+
+      const result = ColorSpaceUtils.rgb.fillRgb(
+        dest,
+        count,
+        1,
+        count,
+        1,
+        1,
+        8,
+        src,
+        1,
+        true
+      );
+
+      for (let i = 0; i < count; i++) {
+        expect(dest.subarray(i * 4, i * 4 + 4)).toEqual(
+          new Uint8ClampedArray([i, i + 1, i + 2, 255 - i])
+        );
+      }
+      expect(result.branch).toEqual("passthrough");
+      expect(result.temporaryBytes).toEqual(0);
+    });
+
+    it("should preserve alpha in the DeviceGray fast path", function () {
+      const count = 65;
+      const src = new Uint8Array(count);
+      const dest = new Uint8ClampedArray(count * 4);
+      for (let i = 0; i < count; i++) {
+        src[i] = i;
+        dest[i * 4 + 3] = 255 - i;
+      }
+
+      const result = ColorSpaceUtils.gray.fillRgb(
+        dest,
+        count,
+        1,
+        count,
+        1,
+        1,
+        8,
+        src,
+        1,
+        true
+      );
+
+      for (let i = 0; i < count; i++) {
+        expect(dest.subarray(i * 4, i * 4 + 4)).toEqual(
+          new Uint8ClampedArray([i, i, i, 255 - i])
+        );
+      }
+      expect(result.branch).toEqual("direct");
+    });
+
+    it("should convert only selected pixels when downscaling", function () {
+      const src = new Uint8Array([10, 20, 30, 40, 50, 60, 70, 80]);
+      const dest = new Uint8ClampedArray(2 * 3);
+
+      const result = ColorSpaceUtils.gray.fillRgb(
+        dest,
+        4,
+        2,
+        2,
+        1,
+        1,
+        8,
+        src,
+        0,
+        true
+      );
+
+      expect(dest).toEqual(new Uint8ClampedArray([10, 10, 10, 30, 30, 30]));
+      expect(result.branch).toEqual("resize");
+      expect(result.temporaryBytes).toEqual(2);
+    });
+
+    it("should resize images wider than 65,535 pixels", function () {
+      const src = new Uint8Array(140000 * 3);
+      src.set([10, 20, 30], 0);
+      src.set([40, 50, 60], 70000 * 3);
+      const dest = new Uint8ClampedArray(2 * 3);
+
+      ColorSpaceUtils.rgb.fillRgb(dest, 140000, 1, 2, 1, 1, 8, src, 0);
+
+      expect(dest).toEqual(new Uint8ClampedArray([10, 20, 30, 40, 50, 60]));
+    });
+  });
+
   describe("ColorSpace caching", function () {
     let globalColorSpaceCache, localColorSpaceCache;
 
@@ -818,7 +916,18 @@ describe("colorspace", function () {
         23, 155, 35,
         147, 69, 93,
       ]);
-      colorSpace.fillRgb(testDest, 2, 2, 3, 3, 3, 8, testSrc, 0);
+      const result = colorSpace.fillRgb(
+        testDest,
+        2,
+        2,
+        3,
+        3,
+        3,
+        8,
+        testSrc,
+        0,
+        true
+      );
 
       expect(colorSpace.getRgb([2], 0)).toEqual(
         new Uint8ClampedArray([255, 109, 70])
@@ -826,6 +935,8 @@ describe("colorspace", function () {
       expect(colorSpace.isPassthrough(8)).toBeFalse();
       expect(colorSpace.isDefaultDecode([0, 1], 1)).toBeTrue();
       expect(testDest).toEqual(expectedDest);
+      expect(result.branch).toEqual("resize");
+      expect(result.temporaryBytes).toEqual(0);
     });
   });
 

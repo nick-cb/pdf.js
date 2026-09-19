@@ -729,12 +729,22 @@ class PDFImage {
     if (!ImageProfiler.enabled) {
       return ImageProfiler.disabledProfile;
     }
+    let maskType = "none";
+    if (this.smask) {
+      maskType = "soft";
+    } else if (Array.isArray(this.mask)) {
+      maskType = "color-key";
+    } else if (this.mask) {
+      maskType = "explicit";
+    }
     return ImageProfiler.start({
       codec: this.filterName ?? "none",
       width: this.width,
       height: this.height,
+      sourcePixels: this.width * this.height,
       drawWidth: this.drawWidth,
       drawHeight: this.drawHeight,
+      destinationPixels: this.drawWidth * this.drawHeight,
       bpc: this.bpc,
       colorSpace: this.colorSpace?.name ?? null,
       numComps: this.numComps,
@@ -744,8 +754,10 @@ class PDFImage {
           : null,
       hasMask: !!this.mask,
       hasSMask: !!this.smask,
+      maskType,
       isMask: this.imageMask,
       needsDecode: !!this.needsDecode,
+      defaultDecode: !this.needsDecode,
       forceRGBA,
     });
   }
@@ -903,6 +915,7 @@ class PDFImage {
         addTraceProfile("get cached image", stepStart);
         imageProfile.mergeBackend(this.image.backendInfo);
         if (image) {
+          this.#recordDecoderOutput(imageProfile, /* alpha01 = */ 0);
           return image;
         }
         stepStart = startTraceProfile();
@@ -914,6 +927,9 @@ class PDFImage {
         stopDecode();
         addTraceProfile("get compact bytes", stepStart);
         imageProfile.mergeBackend(this.image.backendInfo);
+        if (this.image instanceof JpegStream) {
+          this.#recordDecoderOutput(imageProfile, /* alpha01 = */ 0);
+        }
         if (isOffscreenCanvasSupported) {
           if (mustBeResized) {
             stepStart = startTraceProfile();
@@ -979,6 +995,7 @@ class PDFImage {
             addTraceProfile("get cached jpeg image", stepStart);
             imageProfile.mergeBackend(this.image.backendInfo);
             if (image) {
+              this.#recordDecoderOutput(imageProfile, /* alpha01 = */ 1);
               return image;
             }
           }
@@ -1015,6 +1032,7 @@ class PDFImage {
               rgba
             );
             addTraceProfile("create jpeg bitmap", stepStart);
+            this.#recordDecoderOutput(imageProfile, /* alpha01 = */ 1);
             return bitmap;
           }
           if (this.colorSpace.name === "DeviceGray") {
@@ -1046,6 +1064,7 @@ class PDFImage {
           imageProfile.mergeBackend(this.image.backendInfo);
           imgData.width = this.image.decodedWidth;
           imgData.height = this.image.decodedHeight;
+          this.#recordDecoderOutput(imageProfile, /* alpha01 = */ 0);
 
           if (isOffscreenCanvasSupported) {
             if (ImageResizer.needsToBeResized(imgData.width, imgData.height)) {
@@ -1071,7 +1090,6 @@ class PDFImage {
     }
 
     if (
-      isOffscreenCanvasSupported &&
       !mustBeResized &&
       !this.needsDecode &&
       bpc === 8 &&
@@ -1084,16 +1102,38 @@ class PDFImage {
         this.colorSpace.name === "DeviceRGB") &&
       this.image instanceof JpegStream
     ) {
-      const nativeData = await this.#createImageDataFromFrame(
+      if (isOffscreenCanvasSupported) {
+        const nativeData = await this.#createImageDataFromFrame(
+          drawWidth,
+          drawHeight,
+          imageProfile,
+          traceProfile
+        );
+        if (nativeData) {
+          return nativeData;
+        }
+      }
+      return this.#createImageDataFromJpeg(
         drawWidth,
         drawHeight,
+        isOffscreenCanvasSupported,
         imageProfile,
         traceProfile
       );
-      if (nativeData) {
-        return nativeData;
-      }
     }
+    let fillRgbBypassReason = "unsupported color space";
+    if (!(this.image instanceof JpegStream)) {
+      fillRgbBypassReason = "not a JPEG";
+    } else if (this.needsDecode) {
+      fillRgbBypassReason = "non-default Decode";
+    } else if (bpc !== 8) {
+      fillRgbBypassReason = "bits per component";
+    } else if (drawWidth !== originalWidth || drawHeight !== originalHeight) {
+      fillRgbBypassReason = "dimension mismatch";
+    } else if (Array.isArray(this.mask)) {
+      fillRgbBypassReason = "color-key mask";
+    }
+    imageProfile.set({ fillRgbBypassReason });
     let stepStart = startTraceProfile();
     const stopDecode = imageProfile.timer("decode");
     const imgArray = await this.getImageBytes(originalHeight * rowBytes, {
@@ -1159,7 +1199,7 @@ class PDFImage {
     }
     stepStart = startTraceProfile();
     const stopConversion = imageProfile.timer("colorConversion");
-    this.colorSpace.fillRgb(
+    const conversion = this.colorSpace.fillRgb(
       data,
       originalWidth,
       originalHeight,
@@ -1168,9 +1208,19 @@ class PDFImage {
       actualHeight,
       bpc,
       comps,
-      alpha01
+      alpha01,
+      ImageProfiler.enabled
     );
     stopConversion();
+    if (conversion) {
+      imageProfile.set({
+        alpha01,
+        fillRgbBranch: conversion.branch,
+        getRgbBuffer: conversion.converter,
+        qcms: conversion.qcms,
+        temporaryRgbBytes: conversion.temporaryBytes,
+      });
+    }
     addTraceProfile("color conversion", stepStart);
     if (maybeUndoPreblend) {
       stepStart = startTraceProfile();
@@ -1419,9 +1469,58 @@ class PDFImage {
     }
     this.undoPreblend(data, width, height);
     stopConversion();
+    this.#recordDecoderOutput(imageProfile, /* alpha01 = */ 1);
 
     imageProfile.backend("ImageDecoder");
     return this.createBitmap(ImageKind.RGBA_32BPP, width, height, data);
+  }
+
+  async #createImageDataFromJpeg(
+    width,
+    height,
+    isOffscreenCanvasSupported,
+    imageProfile,
+    traceProfile
+  ) {
+    const stopDecode = imageProfile.timer("decode");
+    const data = await this.getImageBytes(width * height * 4, {
+      drawWidth: width,
+      drawHeight: height,
+      forceRGBA: true,
+      internal: true,
+      profile: traceProfile,
+    });
+    stopDecode();
+    imageProfile.mergeBackend(this.image.backendInfo);
+
+    const stopConversion = imageProfile.timer("colorConversion");
+    if (this.smask || this.mask) {
+      await this.fillOpacity(data, width, height, height, null);
+    }
+    this.undoPreblend(data, width, height);
+    stopConversion();
+    this.#recordDecoderOutput(imageProfile, /* alpha01 = */ 1);
+
+    if (isOffscreenCanvasSupported) {
+      return this.createBitmap(ImageKind.RGBA_32BPP, width, height, data);
+    }
+    return {
+      data,
+      width,
+      height,
+      interpolate: this.interpolate,
+      kind: ImageKind.RGBA_32BPP,
+    };
+  }
+
+  #recordDecoderOutput(imageProfile, alpha01) {
+    imageProfile.set({
+      alpha01,
+      fillRgbBranch: "decoder-output",
+      getRgbBuffer: null,
+      qcms: this.colorSpace.usesQcms,
+      temporaryRgbBytes: 0,
+    });
   }
 
   async #getImage(width, height, traceProfile = null) {

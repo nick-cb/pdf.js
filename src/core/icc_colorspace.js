@@ -50,6 +50,10 @@ class IccColorSpace extends ColorSpace {
 
   static #finalizer = null;
 
+  get usesQcms() {
+    return true;
+  }
+
   constructor(iccProfile, name, numComps) {
     if (!IccColorSpace.isUsable) {
       throw new Error("No ICC color space support");

@@ -26,6 +26,8 @@ import {
 import { BaseStream } from "./base_stream.js";
 import { MathClamp } from "../shared/math_clamp.js";
 
+const FAST_PATH_MIN_PIXELS = 64;
+
 /**
  * Resizes an RGB image with 3 components.
  * @param {TypedArray} src - The source buffer.
@@ -43,7 +45,7 @@ function resizeRgbImage(src, dest, w1, h1, w2, h2, alpha01) {
   const yRatio = h1 / h2;
   let newIndex = 0,
     oldIndex;
-  const xScaled = new Uint16Array(w2);
+  const xScaled = new Uint32Array(w2);
   const w1Scanline = w1 * COMPONENTS;
 
   for (let i = 0; i < w2; i++) {
@@ -65,7 +67,7 @@ function resizeRgbaImage(src, dest, w1, h1, w2, h2, alpha01) {
   const xRatio = w1 / w2;
   const yRatio = h1 / h2;
   let newIndex = 0;
-  const xScaled = new Uint16Array(w2);
+  const xScaled = new Uint32Array(w2);
 
   if (alpha01 === 1) {
     for (let i = 0; i < w2; i++) {
@@ -96,6 +98,140 @@ function resizeRgbaImage(src, dest, w1, h1, w2, h2, alpha01) {
       }
     }
   }
+}
+
+function copyRgbImage(src, dest, count, alpha01) {
+  if (alpha01 === 0) {
+    dest.set(src.subarray(0, count * 3));
+    return;
+  }
+  if (
+    count >= FAST_PATH_MIN_PIXELS &&
+    dest.byteOffset % 4 === 0 &&
+    src.byteOffset % 4 === 0
+  ) {
+    const dest32 = new Uint32Array(dest.buffer, dest.byteOffset, count);
+    const length = count * 3;
+    const length32 = length >> 2;
+    const src32 = new Uint32Array(src.buffer, src.byteOffset, length32);
+    let i = 0,
+      destOffset = 0;
+    if (FeatureTest.isLittleEndian) {
+      for (; i < length32 - 2; i += 3, destOffset += 4) {
+        const s1 = src32[i],
+          s2 = src32[i + 1],
+          s3 = src32[i + 2];
+        dest32[destOffset] =
+          (dest32[destOffset] & 0xff000000) | (s1 & 0x00ffffff);
+        dest32[destOffset + 1] =
+          (dest32[destOffset + 1] & 0xff000000) |
+          (((s1 >>> 24) | (s2 << 8)) & 0x00ffffff);
+        dest32[destOffset + 2] =
+          (dest32[destOffset + 2] & 0xff000000) |
+          (((s2 >>> 16) | (s3 << 16)) & 0x00ffffff);
+        dest32[destOffset + 3] =
+          (dest32[destOffset + 3] & 0xff000000) | (s3 >>> 8);
+      }
+      for (let srcOffset = i * 4; destOffset < count; destOffset++) {
+        dest32[destOffset] =
+          (dest32[destOffset] & 0xff000000) |
+          src[srcOffset++] |
+          (src[srcOffset++] << 8) |
+          (src[srcOffset++] << 16);
+      }
+    } else {
+      for (; i < length32 - 2; i += 3, destOffset += 4) {
+        const s1 = src32[i],
+          s2 = src32[i + 1],
+          s3 = src32[i + 2];
+        dest32[destOffset] =
+          (dest32[destOffset] & 0x000000ff) | (s1 & 0xffffff00);
+        dest32[destOffset + 1] =
+          (dest32[destOffset + 1] & 0x000000ff) |
+          (((s1 << 24) | (s2 >>> 8)) & 0xffffff00);
+        dest32[destOffset + 2] =
+          (dest32[destOffset + 2] & 0x000000ff) |
+          (((s2 << 16) | (s3 >>> 16)) & 0xffffff00);
+        dest32[destOffset + 3] =
+          (dest32[destOffset + 3] & 0x000000ff) | (s3 << 8);
+      }
+      for (let srcOffset = i * 4; destOffset < count; destOffset++) {
+        dest32[destOffset] =
+          (dest32[destOffset] & 0x000000ff) |
+          (src[srcOffset++] << 24) |
+          (src[srcOffset++] << 16) |
+          (src[srcOffset++] << 8);
+      }
+    }
+    return;
+  }
+  for (let i = 0, srcOffset = 0, destOffset = 0; i < count; i++) {
+    dest[destOffset++] = src[srcOffset++];
+    dest[destOffset++] = src[srcOffset++];
+    dest[destOffset++] = src[srcOffset++];
+    destOffset++;
+  }
+}
+
+function fillColorMap(
+  src,
+  dest,
+  colorMap,
+  originalWidth,
+  originalHeight,
+  width,
+  height,
+  alpha01,
+  highVal = Number.MAX_SAFE_INTEGER
+) {
+  const xRatio = originalWidth / width;
+  const yRatio = originalHeight / height;
+  const xScaled = new Uint32Array(width);
+  for (let i = 0; i < width; i++) {
+    xScaled[i] = Math.floor(i * xRatio);
+  }
+
+  let destOffset = 0;
+  for (let row = 0; row < height; row++) {
+    const srcRow = Math.floor(row * yRatio) * originalWidth;
+    for (let col = 0; col < width; col++) {
+      const key =
+        MathClamp(Math.round(src[srcRow + xScaled[col]]), 0, highVal) * 3;
+      dest[destOffset++] = colorMap[key];
+      dest[destOffset++] = colorMap[key + 1];
+      dest[destOffset++] = colorMap[key + 2];
+      destOffset += alpha01;
+    }
+  }
+}
+
+function resizeColorComponents(
+  src,
+  numComps,
+  originalWidth,
+  originalHeight,
+  width,
+  height
+) {
+  const resized = new src.constructor(width * height * numComps);
+  const xRatio = originalWidth / width;
+  const yRatio = originalHeight / height;
+  const xScaled = new Uint32Array(width);
+  for (let i = 0; i < width; i++) {
+    xScaled[i] = Math.floor(i * xRatio) * numComps;
+  }
+
+  let destOffset = 0;
+  for (let row = 0; row < height; row++) {
+    const srcRow = Math.floor(row * yRatio) * originalWidth * numComps;
+    for (let col = 0; col < width; col++) {
+      let srcOffset = srcRow + xScaled[col];
+      for (let i = 0; i < numComps; i++) {
+        resized[destOffset++] = src[srcOffset++];
+      }
+    }
+  }
+  return resized;
 }
 
 function copyRgbaImage(src, dest, alpha01) {
@@ -226,7 +362,8 @@ class ColorSpace {
     actualHeight,
     bpc,
     comps,
-    alpha01
+    alpha01,
+    collectStats = false
   ) {
     if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
       assert(
@@ -236,22 +373,41 @@ class ColorSpace {
     }
     const count = originalWidth * originalHeight;
     let rgbBuf = null;
+    let branch;
+    let temporaryBytes = 0;
     const numComponentColors = 1 << bpc;
     const needsResizing = originalHeight !== height || originalWidth !== width;
+    const isDownscaling = width * height < count;
 
     if (this.isPassthrough(bpc)) {
-      rgbBuf = comps;
+      if (needsResizing) {
+        resizeRgbImage(
+          comps,
+          dest,
+          originalWidth,
+          originalHeight,
+          width,
+          height,
+          alpha01
+        );
+        branch = "passthrough-resize";
+      } else {
+        copyRgbImage(comps, dest, width * actualHeight, alpha01);
+        branch = "passthrough";
+      }
     } else if (
       this.numComps === 1 &&
       count > numComponentColors &&
       this.name !== "DeviceGray" &&
-      this.name !== "DeviceRGB"
+      this.name !== "DeviceRGB" &&
+      this.name !== "Indexed"
     ) {
       // Optimization: create a color map when there is just one component and
       // we are converting more colors than the size of the color map. We
       // don't build the map if the colorspace is gray or rgb since those
       // methods are faster than building a map. This mainly offers big speed
-      // ups for indexed and alternate colorspaces.
+      // ups for alternate colorspaces. Indexed color spaces already own a
+      // converted palette and handle their lookup directly.
       //
       // TODO it may be worth while to cache the color map. While running
       // testing I never hit a cache so I will leave that out for now (perhaps
@@ -264,6 +420,7 @@ class ColorSpace {
         allColors[i] = i;
       }
       const colorMap = new Uint8ClampedArray(numComponentColors * 3);
+      temporaryBytes = allColors.byteLength + colorMap.byteLength;
       this.getRgbBuffer(
         allColors,
         0,
@@ -274,32 +431,38 @@ class ColorSpace {
         /* alpha01 = */ 0
       );
 
-      if (!needsResizing) {
-        // Fill in the RGB values directly into |dest|.
-        let destPos = 0;
-        for (let i = 0; i < count; ++i) {
-          const key = comps[i] * 3;
-          dest[destPos++] = colorMap[key];
-          dest[destPos++] = colorMap[key + 1];
-          dest[destPos++] = colorMap[key + 2];
-          destPos += alpha01;
-        }
-      } else {
-        rgbBuf = new Uint8Array(count * 3);
-        let rgbPos = 0;
-        for (let i = 0; i < count; ++i) {
-          const key = comps[i] * 3;
-          rgbBuf[rgbPos++] = colorMap[key];
-          rgbBuf[rgbPos++] = colorMap[key + 1];
-          rgbBuf[rgbPos++] = colorMap[key + 2];
-        }
-      }
+      fillColorMap(
+        comps,
+        dest,
+        colorMap,
+        originalWidth,
+        originalHeight,
+        needsResizing ? width : originalWidth,
+        needsResizing ? height : originalHeight,
+        alpha01
+      );
+      branch = "lookup";
     } else if (!needsResizing) {
       // Fill in the RGB values directly into |dest|.
       this.getRgbBuffer(comps, 0, width * actualHeight, dest, 0, bpc, alpha01);
+      branch = "direct";
+    } else if (isDownscaling) {
+      const resized = resizeColorComponents(
+        comps,
+        this.numComps,
+        originalWidth,
+        originalHeight,
+        width,
+        height
+      );
+      temporaryBytes = resized.byteLength;
+      this.getRgbBuffer(resized, 0, width * height, dest, 0, bpc, alpha01);
+      branch = "resize";
     } else {
       rgbBuf = new Uint8ClampedArray(count * 3);
+      temporaryBytes = rgbBuf.byteLength;
       this.getRgbBuffer(comps, 0, count, rgbBuf, 0, bpc, /* alpha01 = */ 0);
+      branch = "convert-then-resize";
     }
 
     if (rgbBuf) {
@@ -324,6 +487,15 @@ class ColorSpace {
         }
       }
     }
+    if (collectStats) {
+      return {
+        branch,
+        converter: `${this.constructor.name}.getRgbBuffer`,
+        qcms: this.usesQcms,
+        temporaryBytes,
+      };
+    }
+    return null;
   }
 
   /**
@@ -333,6 +505,10 @@ class ColorSpace {
    */
   get usesZeroToOneRange() {
     return shadow(this, "usesZeroToOneRange", true);
+  }
+
+  get usesQcms() {
+    return false;
   }
 
   /**
@@ -526,6 +702,45 @@ class IndexedCS extends ColorSpace {
     }
   }
 
+  fillRgb(
+    dest,
+    originalWidth,
+    originalHeight,
+    width,
+    height,
+    actualHeight,
+    bpc,
+    comps,
+    alpha01,
+    collectStats = false
+  ) {
+    const needsResizing = originalHeight !== height || originalWidth !== width;
+    if (needsResizing) {
+      fillColorMap(
+        comps,
+        dest,
+        this.#rgbLookup,
+        originalWidth,
+        originalHeight,
+        width,
+        height,
+        alpha01,
+        this.highVal
+      );
+    } else {
+      this.getRgbBuffer(comps, 0, width * actualHeight, dest, 0, bpc, alpha01);
+    }
+    if (collectStats) {
+      return {
+        branch: needsResizing ? "resize" : "direct",
+        converter: `${this.constructor.name}.getRgbBuffer`,
+        qcms: false,
+        temporaryBytes: 0,
+      };
+    }
+    return null;
+  }
+
   isDefaultDecode(decode, bpc) {
     if (isDefaultDecodeHelper(decode, 2)) {
       return true;
@@ -563,6 +778,64 @@ class DeviceGrayCS extends ColorSpace {
         dest instanceof Uint8ClampedArray,
         'DeviceGrayCS.getRgbBuffer: Unsupported "dest" type.'
       );
+    }
+    if (
+      bits === 8 &&
+      alpha01 === 1 &&
+      count >= FAST_PATH_MIN_PIXELS &&
+      (dest.byteOffset + destOffset) % 4 === 0 &&
+      (src.byteOffset + srcOffset) % 4 === 0
+    ) {
+      const dest32 = new Uint32Array(
+        dest.buffer,
+        dest.byteOffset + destOffset,
+        count
+      );
+      const alphaMask = FeatureTest.isLittleEndian ? 0xff000000 : 0x000000ff;
+      const multiplier = FeatureTest.isLittleEndian ? 0x10101 : 0x1010100;
+      const wordCount = count >> 2;
+      const src32 = new Uint32Array(
+        src.buffer,
+        src.byteOffset + srcOffset,
+        wordCount
+      );
+      let i = 0,
+        destPos = 0;
+      if (FeatureTest.isLittleEndian) {
+        for (; i < wordCount; i++, destPos += 4) {
+          const values = src32[i];
+          dest32[destPos] =
+            (dest32[destPos] & alphaMask) | ((values & 0xff) * multiplier);
+          dest32[destPos + 1] =
+            (dest32[destPos + 1] & alphaMask) |
+            (((values >>> 8) & 0xff) * multiplier);
+          dest32[destPos + 2] =
+            (dest32[destPos + 2] & alphaMask) |
+            (((values >>> 16) & 0xff) * multiplier);
+          dest32[destPos + 3] =
+            (dest32[destPos + 3] & alphaMask) | ((values >>> 24) * multiplier);
+        }
+      } else {
+        for (; i < wordCount; i++, destPos += 4) {
+          const values = src32[i];
+          dest32[destPos] =
+            (dest32[destPos] & alphaMask) | ((values >>> 24) * multiplier);
+          dest32[destPos + 1] =
+            (dest32[destPos + 1] & alphaMask) |
+            (((values >>> 16) & 0xff) * multiplier);
+          dest32[destPos + 2] =
+            (dest32[destPos + 2] & alphaMask) |
+            (((values >>> 8) & 0xff) * multiplier);
+          dest32[destPos + 3] =
+            (dest32[destPos + 3] & alphaMask) | ((values & 0xff) * multiplier);
+        }
+      }
+      srcOffset += i * 4;
+      for (; destPos < count; destPos++) {
+        dest32[destPos] =
+          (dest32[destPos] & alphaMask) | (src[srcOffset++] * multiplier);
+      }
+      return;
     }
     const scale = 255 / ((1 << bits) - 1);
     let j = srcOffset,
@@ -604,9 +877,15 @@ class DeviceRgbCS extends ColorSpace {
         'DeviceRgbCS.getRgbBuffer: Unsupported "dest" type.'
       );
     }
-    if (bits === 8 && alpha01 === 0) {
-      dest.set(src.subarray(srcOffset, srcOffset + count * 3), destOffset);
-      return;
+    if (bits === 8) {
+      if (alpha01 === 0) {
+        dest.set(src.subarray(srcOffset, srcOffset + count * 3), destOffset);
+        return;
+      }
+      if (destOffset === 0) {
+        copyRgbImage(src.subarray(srcOffset), dest, count, alpha01);
+        return;
+      }
     }
     const scale = 255 / ((1 << bits) - 1);
     let j = srcOffset,
@@ -645,7 +924,8 @@ class DeviceRgbaCS extends ColorSpace {
     actualHeight,
     bpc,
     comps,
-    alpha01
+    alpha01,
+    collectStats = false
   ) {
     if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
       assert(
@@ -666,6 +946,18 @@ class DeviceRgbaCS extends ColorSpace {
     } else {
       copyRgbaImage(comps, dest, alpha01);
     }
+    if (collectStats) {
+      return {
+        branch:
+          originalHeight !== height || originalWidth !== width
+            ? "passthrough-resize"
+            : "passthrough",
+        converter: null,
+        qcms: false,
+        temporaryBytes: 0,
+      };
+    }
+    return null;
   }
 }
 

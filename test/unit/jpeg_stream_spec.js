@@ -13,12 +13,20 @@
  * limitations under the License.
  */
 
-import { Dict } from "../../src/core/primitives.js";
+import { Dict, Name } from "../../src/core/primitives.js";
+import {
+  GlobalColorSpaceCache,
+  LocalColorSpaceCache,
+} from "../../src/core/image_utils.js";
+import { ImageKind, stringToBytes } from "../../src/shared/util.js";
+import { ImageProfiler } from "../../src/core/image_profiler.js";
 import { ImageResizer } from "../../src/core/image_resizer.js";
 import { JpegImage } from "../../src/core/jpg.js";
 import { JpegStream } from "../../src/core/jpeg_stream.js";
+import { PDFFunctionFactory } from "../../src/core/function.js";
+import { PDFImage } from "../../src/core/image.js";
 import { Stream } from "../../src/core/stream.js";
-import { stringToBytes } from "../../src/shared/util.js";
+import { XRefMock } from "./test_utils.js";
 
 // Only a JPEG header is needed: `canUseImageDecoder` stops at the SOF marker.
 function createJpeg({
@@ -312,6 +320,8 @@ describe("jpeg_stream", function () {
         isImageDecoderSupported: false,
         useWasm: true,
       });
+      ImageProfiler.setOptions({ profileImages: false });
+      ImageProfiler.clear();
     });
 
     it("should fall back to `JpegImage`, and say so", async function () {
@@ -343,6 +353,53 @@ describe("jpeg_stream", function () {
 
       const native = await createDecoded(TINY_RGB).getImageData(0, null);
       expect(native.length).toEqual(16 * 16 * 3);
+    });
+
+    it("should compose an explicit mask into decoder RGBA output", async function () {
+      const bytes = stringToBytes(atob(TINY_RGB));
+      const imageDict = new Dict();
+      imageDict.set("W", 16);
+      imageDict.set("H", 16);
+      imageDict.set("BPC", 8);
+      imageDict.set("CS", Name.get("DeviceRGB"));
+      imageDict.set("F", Name.get("DCTDecode"));
+      const image = new JpegStream(
+        new Stream(bytes, 0, bytes.length, imageDict),
+        bytes.length,
+        null
+      );
+
+      const maskDict = new Dict();
+      maskDict.set("W", 16);
+      maskDict.set("H", 16);
+      maskDict.set("BPC", 1);
+      maskDict.set("IM", true);
+      const maskBytes = new Uint8Array(16 * 2);
+      maskBytes[0] = 0xff;
+      const mask = new Stream(maskBytes, 0, maskBytes.length, maskDict);
+
+      const xref = new XRefMock();
+      const pdfImage = new PDFImage({
+        xref,
+        res: null,
+        image,
+        mask,
+        pdfFunctionFactory: new PDFFunctionFactory({ xref }),
+        globalColorSpaceCache: new GlobalColorSpaceCache(),
+        localColorSpaceCache: new LocalColorSpaceCache(),
+      });
+      ImageProfiler.setOptions({ profileImages: true });
+
+      const result = await pdfImage.createImageData(false, false);
+
+      expect(result.kind).toEqual(ImageKind.RGBA_32BPP);
+      expect(result.data.length).toEqual(16 * 16 * 4);
+      for (let i = 3; i < 8 * 4; i += 4) {
+        expect(result.data[i]).toEqual(0);
+      }
+      expect(result.data[8 * 4 + 3]).toEqual(255);
+      expect(ImageProfiler.entries[0].fillRgbBranch).toEqual("decoder-output");
+      expect(ImageProfiler.entries[0].backend).toEqual("JpegImage");
     });
 
     it("should not reduce on the JavaScript path", async function () {
