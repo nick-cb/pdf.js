@@ -298,9 +298,9 @@ class PDFThumbnailView extends RenderableView {
    * PLEASE NOTE: Most likely you want to use the `this.reset()` method,
    *              rather than calling this one directly.
    */
-  cancelRendering() {
+  cancelRendering({ abortOperatorList = false } = {}) {
     if (this.renderTask) {
-      this.renderTask.cancel();
+      this.renderTask.cancel(/* extraDelay = */ 0, abortOperatorList);
       this.renderTask = null;
     }
     this.resume = null;

@@ -128,6 +128,10 @@ const deferred = Promise.resolve();
 
 // Callback function used when validating operation arguments.
 const argIsDict = arg => arg instanceof Dict;
+const OPS_NAMES = new Map();
+for (const [name, op] of Object.entries(OPS)) {
+  OPS_NAMES.set(op, name);
+}
 
 // Convert PDF blend mode names to HTML5 blend mode names.
 function normalizeBlendMode(value, parsingArray = false) {
@@ -582,7 +586,7 @@ class PartialEvaluator {
     }
   }
 
-  _sendImgData(objId, imgData, cacheGlobally = false) {
+  _sendImgData(objId, imgData, cacheGlobally = false, profile = null) {
     if (
       (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) &&
       imgData
@@ -594,13 +598,13 @@ class PartialEvaluator {
     if (this.parsingType3Font || cacheGlobally) {
       return this.handler.send(
         "commonobj",
-        [objId, "Image", imgData],
+        [objId, "Image", imgData, this.pageIndex, profile],
         transfers
       );
     }
     return this.handler.send(
       "obj",
-      [objId, this.pageIndex, "Image", imgData],
+      [objId, this.pageIndex, "Image", imgData, profile],
       transfers
     );
   }
@@ -619,6 +623,14 @@ class PartialEvaluator {
 
     const { dict } = image;
     const imageRef = dict.objId;
+    const profileLabel = cacheKey || imageRef?.toString() || "inline";
+    const startProfile = () =>
+      typeof performance !== "undefined" ? performance.now() : Date.now();
+    const addImageProfile = (name, start, end = startProfile()) => {
+      operatorList.addProfile(`image ${profileLabel}: ${name}`, start, end);
+    };
+
+    const setupStart = startProfile();
     const w = dict.get("W", "Width");
     const h = dict.get("H", "Height");
 
@@ -635,13 +647,16 @@ class PartialEvaluator {
       warn(msg);
       return;
     }
+    addImageProfile("setup", setupStart);
 
     let optionalContent;
     if (dict.has("OC")) {
+      const optionalContentStart = startProfile();
       optionalContent = await this.parseMarkedContentProps(
         dict.get("OC"),
         resources
       );
+      addImageProfile("optional content", optionalContentStart);
     }
 
     const imageMask = dict.get("IM", "ImageMask") || false;
@@ -652,11 +667,13 @@ class PartialEvaluator {
       // data can't be done here. Instead of creating a
       // complete PDFImage, only read the information needed
       // for later.
+      const createMaskStart = startProfile();
       imgData = await PDFImage.createMask({
         image,
         isOffscreenCanvasSupported:
           isOffscreenCanvasSupported && !this.parsingType3Font,
       });
+      addImageProfile("create mask", createMaskStart);
 
       if (imgData.isSingleOpaquePixel) {
         // Handles special case of mainly LaTeX documents which use image
@@ -711,12 +728,14 @@ class PartialEvaluator {
       }
 
       const objId = `mask_${this.idFactory.createObjId()}`;
+      const enqueueStart = startProfile();
       operatorList.addDependency(objId);
 
       imgData.dataLen = imgData.bitmap
         ? imgData.width * imgData.height * 4
         : imgData.data.length;
       this._sendImgData(objId, imgData);
+      addImageProfile("send mask data", enqueueStart);
 
       fn = OPS.paintImageMaskXObject;
       args = [
@@ -729,6 +748,7 @@ class PartialEvaluator {
         },
       ];
       operatorList.addImageOps(fn, args, optionalContent);
+      addImageProfile("enqueue mask operator", enqueueStart);
 
       if (cacheKey) {
         const cacheData = { objId, fn, args, optionalContent };
@@ -746,6 +766,7 @@ class PartialEvaluator {
     // Inlining small images into the queue as RGB data
     if (isInline && w + h < SMALL_IMAGE_DIMENSIONS && !hasMask) {
       try {
+        const buildImageStart = startProfile();
         const imageObj = new PDFImage({
           xref: this.xref,
           res: resources,
@@ -755,17 +776,25 @@ class PartialEvaluator {
           globalColorSpaceCache: this.globalColorSpaceCache,
           localColorSpaceCache,
         });
+        addImageProfile("build inline image", buildImageStart);
         // We force the use of RGBA_32BPP images here, because we can't handle
         // any other kind.
+        const createImageDataStart = startProfile();
         imgData = await imageObj.createImageData(
           /* forceRGBA = */ true,
-          /* isOffscreenCanvasSupported = */ false
+          /* isOffscreenCanvasSupported = */ false,
+          (name, start, end) => {
+            addImageProfile(`create image data: ${name}`, start, end);
+          }
         );
+        addImageProfile("create inline image data", createImageDataStart);
+        const enqueueStart = startProfile();
         operatorList.addImageOps(
           OPS.paintInlineImageXObject,
           [imgData],
           optionalContent
         );
+        addImageProfile("enqueue inline image operator", enqueueStart);
       } catch (reason) {
         const msg = `Unable to decode inline image: "${reason}".`;
 
@@ -799,11 +828,13 @@ class PartialEvaluator {
     }
 
     // Ensure that the dependency is added before the image is decoded.
+    const enqueueStart = startProfile();
     operatorList.addDependency(objId);
 
     fn = OPS.paintImageXObject;
     args = [objId, w, h];
     operatorList.addImageOps(fn, args, optionalContent, hasMask);
+    addImageProfile("enqueue dependency and operator", enqueueStart);
 
     if (cacheGlobally) {
       globalCacheData = {
@@ -816,9 +847,11 @@ class PartialEvaluator {
       };
 
       if (this.globalImageCache.hasDecodeFailed(imageRef)) {
+        const decodeFailedStart = startProfile();
         this.globalImageCache.setData(imageRef, globalCacheData);
 
         this._sendImgData(objId, /* imgData = */ null, cacheGlobally);
+        addImageProfile("send cached decode failure", decodeFailedStart);
         return;
       }
 
@@ -826,11 +859,13 @@ class PartialEvaluator {
       // globally, check if the image is still cached locally on the main-thread
       // to avoid having to re-parse the image (since that can be slow).
       if (w * h > 250000 || hasMask) {
+        const copyLocalStart = startProfile();
         const localLength = await this.handler.sendWithPromise("commonobj", [
           objId,
           "CopyLocalImage",
           { imageRef },
         ]);
+        addImageProfile("copy local image check", copyLocalStart);
 
         if (localLength) {
           this.globalImageCache.setData(imageRef, globalCacheData);
@@ -840,7 +875,8 @@ class PartialEvaluator {
       }
     }
 
-    PDFImage.buildImage({
+    const buildImageStart = startProfile();
+    const imageObjPromise = PDFImage.buildImage({
       xref: this.xref,
       res: resources,
       image,
@@ -848,12 +884,29 @@ class PartialEvaluator {
       pdfFunctionFactory: this._pdfFunctionFactory,
       globalColorSpaceCache: this.globalColorSpaceCache,
       localColorSpaceCache,
-    })
+    });
+    addImageProfile("build image", buildImageStart);
+
+    const imageProfile = [];
+    const addAsyncImageProfile = (name, start, end = startProfile()) => {
+      imageProfile.push({
+        name: `image ${profileLabel}: ${name}`,
+        start,
+        end,
+      });
+    };
+
+    imageObjPromise
       .then(async imageObj => {
+        const createImageDataStart = startProfile();
         imgData = await imageObj.createImageData(
           /* forceRGBA = */ false,
-          isOffscreenCanvasSupported
+          isOffscreenCanvasSupported,
+          (name, start, end) => {
+            addAsyncImageProfile(`create image data: ${name}`, start, end);
+          }
         );
+        addAsyncImageProfile("create image data", createImageDataStart);
         imgData.dataLen = imgData.bitmap
           ? imgData.width * imgData.height * 4
           : imgData.data.length;
@@ -862,7 +915,15 @@ class PartialEvaluator {
         if (cacheGlobally) {
           this.globalImageCache.addByteSize(imageRef, imgData.dataLen);
         }
-        return this._sendImgData(objId, imgData, cacheGlobally);
+        const sendImageDataStart = startProfile();
+        const result = this._sendImgData(
+          objId,
+          imgData,
+          cacheGlobally,
+          imageProfile
+        );
+        addImageProfile("send image data", sendImageDataStart);
+        return result;
       })
       .catch(reason => {
         warn(`Unable to decode image "${objId}": "${reason}".`);
@@ -870,7 +931,15 @@ class PartialEvaluator {
         if (imageRef) {
           this.globalImageCache.addDecodeFailed(imageRef);
         }
-        return this._sendImgData(objId, /* imgData = */ null, cacheGlobally);
+        const sendFailureStart = startProfile();
+        const result = this._sendImgData(
+          objId,
+          /* imgData = */ null,
+          cacheGlobally,
+          imageProfile
+        );
+        addImageProfile("send decode failure", sendFailureStart);
+        return result;
       });
 
     if (cacheKey) {
@@ -1714,6 +1783,15 @@ class PartialEvaluator {
     const preprocessor = new EvaluatorPreprocessor(stream, xref, stateManager);
     const timeSlotManager = new TimeSlotManager();
     let markedContentLevel = 0;
+    const startProfile = () =>
+      typeof performance !== "undefined" ? performance.now() : Date.now();
+    const addOperatorProfile = (fn, start, detail = null) => {
+      operatorList.addProfile(
+        `op ${OPS_NAMES.get(fn) || fn}${detail ? ` ${detail}` : ""}`,
+        start,
+        startProfile()
+      );
+    };
 
     function closePendingRestoreOPS(argument) {
       for (let i = 0, ii = preprocessor.savedStatesDepth; i < ii; i++) {
@@ -1753,6 +1831,7 @@ class PartialEvaluator {
         }
         let args = operation.args;
         let fn = operation.fn;
+        const operationStart = startProfile();
 
         switch (fn | 0) {
           case OPS.paintXObject:
@@ -1764,6 +1843,7 @@ class PartialEvaluator {
               const localImage = localImageCache.getByName(name);
               if (localImage) {
                 addCachedImageOps(operatorList, localImage);
+                addOperatorProfile(fn, operationStart, name);
                 args = null;
                 continue;
               }
@@ -1839,16 +1919,30 @@ class PartialEvaluator {
                   );
                 }
                 resolveXObject();
-              }).catch(reason => {
-                if (reason instanceof AbortException) {
-                  return;
-                }
-                if (self.options.ignoreErrors) {
-                  warn(`getOperatorList - ignoring XObject: "${reason}".`);
-                  return;
-                }
-                throw reason;
               })
+                .catch(reason => {
+                  if (reason instanceof AbortException) {
+                    return;
+                  }
+                  if (self.options.ignoreErrors) {
+                    warn(`getOperatorList - ignoring XObject: "${reason}".`);
+                    return;
+                  }
+                  throw reason;
+                })
+                .catch(function (reason) {
+                  if (reason instanceof AbortException) {
+                    return;
+                  }
+                  if (self.options.ignoreErrors) {
+                    warn(`getOperatorList - ignoring XObject: "${reason}".`);
+                    return;
+                  }
+                  throw reason;
+                })
+                .finally(() => {
+                  addOperatorProfile(fn, operationStart, name);
+                })
             );
             return;
           case OPS.setFont:
@@ -1871,6 +1965,9 @@ class PartialEvaluator {
                   operatorList.addDependency(loadedName);
                   operatorList.addOp(OPS.setFont, [loadedName, fontSize]);
                 })
+                .finally(() => {
+                  addOperatorProfile(fn, operationStart);
+                })
             );
             return;
           case OPS.endInlineImage:
@@ -1879,20 +1976,25 @@ class PartialEvaluator {
               const localImage = localImageCache.getByName(cacheKey);
               if (localImage) {
                 addCachedImageOps(operatorList, localImage);
+                addOperatorProfile(fn, operationStart, cacheKey);
                 args = null;
                 continue;
               }
             }
             next(
-              self.buildPaintImageXObject({
-                resources,
-                image: args[0],
-                isInline: true,
-                operatorList,
-                cacheKey,
-                localImageCache,
-                localColorSpaceCache,
-              })
+              self
+                .buildPaintImageXObject({
+                  resources,
+                  image: args[0],
+                  isInline: true,
+                  operatorList,
+                  cacheKey,
+                  localImageCache,
+                  localColorSpaceCache,
+                })
+                .finally(() => {
+                  addOperatorProfile(fn, operationStart, cacheKey);
+                })
             );
             return;
           case OPS.showText:

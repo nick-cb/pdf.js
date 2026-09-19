@@ -921,8 +921,9 @@ class PDFPageView extends BasePDFPageView {
     keepXfaLayer = false,
     keepTextLayer = false,
     cancelExtraDelay = 0,
+    abortOperatorList = false,
   } = {}) {
-    super.cancelRendering({ cancelExtraDelay });
+    super.cancelRendering({ cancelExtraDelay, abortOperatorList });
 
     if (this.textLayer && (!keepTextLayer || !this.textLayer.div)) {
       this.textLayer.cancel();

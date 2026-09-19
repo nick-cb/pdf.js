@@ -256,9 +256,9 @@ class BasePDFPageView extends RenderableView {
     }
   }
 
-  cancelRendering({ cancelExtraDelay = 0 } = {}) {
+  cancelRendering({ cancelExtraDelay = 0, abortOperatorList = false } = {}) {
     if (this.renderTask) {
-      this.renderTask.cancel(cancelExtraDelay);
+      this.renderTask.cancel(cancelExtraDelay, abortOperatorList);
       this.renderTask = null;
     }
     this.resume = null;

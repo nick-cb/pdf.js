@@ -475,8 +475,11 @@ class Page {
     annotationStorage = null,
     modifiedIds = null,
   }) {
+    const startProfile = () =>
+      typeof performance !== "undefined" ? performance.now() : Date.now();
     const contentStreamPromise = this.getContentStream();
     const resourcesPromise = this.loadResources(RESOURCES_KEYS_OPERATOR_LIST);
+    const contentResourcesStart = startProfile();
 
     const partialEvaluator = this._createPartialEvaluator(handler, pageIndex);
 
@@ -557,6 +560,12 @@ class Page {
         RESOURCES_KEYS_OPERATOR_LIST
       );
       const opList = new OperatorList(intent, sink);
+      opList.addProfile(
+        "content stream, resources",
+        contentResourcesStart,
+        startProfile()
+      );
+      const blendModesStart = startProfile();
       handler.send("StartRenderPage", {
         transparency: partialEvaluator.hasBlendModes(
           resources,
@@ -565,13 +574,20 @@ class Page {
         pageIndex,
         cacheKey,
       });
+      opList.addProfile("blend mode check", blendModesStart);
 
+      const pageOperatorListStart = startProfile();
       await partialEvaluator.getOperatorList({
         stream: contentStream,
         task,
         resources,
         operatorList: opList,
       });
+      opList.addProfile(
+        "page operator list",
+        pageOperatorListStart,
+        startProfile()
+      );
       return opList;
     });
 
@@ -647,7 +663,13 @@ class Page {
       }
     }
 
+    const annotationOperatorListsStart = startProfile();
     const opLists = await Promise.all(opListPromises);
+    pageOpList.addProfile(
+      "annotation operator lists",
+      annotationOperatorListsStart,
+      startProfile()
+    );
     let form = false,
       canvas = false;
 

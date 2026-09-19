@@ -213,6 +213,22 @@ class PDFPageViewBuffer {
     return this.#buf.has(view);
   }
 
+  cancelRenderingOutsideRange(minId, maxId) {
+    for (const view of this.#buf) {
+      if (view.id >= minId && view.id <= maxId) {
+        continue;
+      }
+      if (
+        view.renderingState !== RenderingStates.RUNNING &&
+        view.renderingState !== RenderingStates.PAUSED
+      ) {
+        continue;
+      }
+      view.cancelRendering({ abortOperatorList: true });
+      view.renderingState = RenderingStates.INITIAL;
+    }
+  }
+
   [Symbol.iterator]() {
     return this.#buf.keys();
   }
@@ -1992,6 +2008,19 @@ class PDFViewer {
     }
     const newCacheSize = Math.max(DEFAULT_CACHE_SIZE, 2 * numVisiblePages + 1);
     this.#buffer.resize(newCacheSize, visible.ids);
+
+    // Keep only the render tasks that the rendering queue can select without
+    // another scroll. Obsolete tasks otherwise continue generating operator
+    // lists in the worker while the newly visible pages wait behind them.
+    const preRenderMargin =
+      this._spreadMode !== SpreadMode.NONE &&
+      this._scrollMode !== ScrollMode.HORIZONTAL
+        ? 2
+        : 1;
+    this.#buffer.cancelRenderingOutsideRange(
+      visible.first.id - preRenderMargin,
+      visible.last.id + preRenderMargin
+    );
 
     for (const { view, visibleArea } of visiblePages) {
       view.updateVisibleArea(visibleArea);

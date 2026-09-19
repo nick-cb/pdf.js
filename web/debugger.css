@@ -35,6 +35,22 @@
   padding: 0;
   width: var(--panel-width);
 }
+#PDFBug.resizing {
+  user-select: none;
+}
+#PDFBug .resizeHandle {
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: -3px;
+  width: 6px;
+  cursor: ew-resize;
+  touch-action: none;
+  z-index: 1;
+}
+#PDFBug .resizeHandle:focus-visible {
+  outline: 2px solid rgb(0 95 223);
+  outline-offset: -2px;
+}
 #PDFBug .controls {
   background: rgb(238 238 238);
   border-bottom: 1px solid rgb(102 102 102);

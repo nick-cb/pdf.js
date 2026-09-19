@@ -84,9 +84,10 @@ async function fetchData(url, type = "text") {
 }
 
 class RenderingCancelledException extends BaseException {
-  constructor(msg, extraDelay = 0) {
+  constructor(msg, extraDelay = 0, abortOperatorList = false) {
     super(msg, "RenderingCancelledException");
     this.extraDelay = extraDelay;
+    this.abortOperatorList = abortOperatorList;
   }
 }
 
@@ -226,22 +227,156 @@ class StatTimer {
     if (!this.#started.has(name)) {
       warn(`Timer has not been started for ${name}`);
     }
-    this.times.push({
-      name,
-      start: this.#started.get(name),
-      end: Date.now(),
-    });
+    this.add(name, this.#started.get(name), Date.now());
     // Remove timer from started so it can be called again.
     this.#started.delete(name);
   }
 
-  toString() {
-    // Find the longest name for padding purposes.
-    const longest = Math.max(...this.times.map(t => t.name.length));
+  timeEndIfStarted(name) {
+    if (!this.#started.has(name)) {
+      return false;
+    }
+    this.timeEnd(name);
+    return true;
+  }
 
-    return this.times
-      .map(t => `${t.name.padEnd(longest)} ${t.end - t.start}ms\n`)
-      .join("");
+  add(name, start, end = Date.now()) {
+    this.times.push({ name, start, end });
+  }
+
+  toString() {
+    const formatDuration = ({ start, end }) => {
+      const duration = end - start;
+      return Number.isInteger(duration) ? duration : duration.toFixed(2);
+    };
+    const entries = this.times.map((time, index) => ({ ...time, index }));
+    const hasRenderingProfile = entries.some(
+      ({ name }) => name === "Rendering" || /^[EO]: /.test(name)
+    );
+
+    let rows;
+    if (hasRenderingProfile) {
+      const used = new Set();
+      rows = [];
+
+      const add = (entry, indent = 0) => {
+        rows.push({ entry, indent });
+        used.add(entry.index);
+      };
+      const addExact = (name, indent) => {
+        for (const entry of entries) {
+          if (entry.name === name && !used.has(entry.index)) {
+            add(entry, indent);
+          }
+        }
+      };
+      const getFirst = name => entries.find(entry => entry.name === name);
+      const addOperatorListProfile = (children, indent) => {
+        const childUsed = new Set();
+        const addChild = (entry, childIndent) => {
+          add(entry, childIndent);
+          childUsed.add(entry.index);
+        };
+        const addChildWithName = (entry, name, childIndent) => {
+          rows.push({ entry: { ...entry, name }, indent: childIndent });
+          used.add(entry.index);
+          childUsed.add(entry.index);
+        };
+        const getOperatorDetail = name => /^O: op \S+ (.+)$/.exec(name)?.[1];
+        const addOperatorChildren = childIndent => {
+          for (const child of children) {
+            if (
+              childUsed.has(child.index) ||
+              !child.name.startsWith("O: op ")
+            ) {
+              continue;
+            }
+            addChild(child, childIndent);
+
+            const detail = getOperatorDetail(child.name);
+            if (!detail) {
+              continue;
+            }
+            const imageChildren = children.filter(
+              imageChild =>
+                !childUsed.has(imageChild.index) &&
+                imageChild.name.startsWith(`O: image ${detail}: `)
+            );
+            for (const imageChild of imageChildren) {
+              addChild(imageChild, childIndent + 1);
+            }
+          }
+        };
+        const opChildren = children.filter(c => c.name.startsWith("O: "));
+        const nonOpChildren = children.filter(c => !c.name.startsWith("O: "));
+        addOperatorChildren(1);
+        for (const child of nonOpChildren) {
+          if (!childUsed.has(child.index)) {
+            addChild(child, 1);
+          }
+        }
+        for (const child of opChildren) {
+          if (!childUsed.has(child.index) && !child.name.startsWith("O: op ")) {
+            addChild(child, 1);
+          }
+        }
+      };
+
+      const overall = getFirst("Overall");
+      const pageRequest = getFirst("Page Request");
+      const renderingReady = getFirst("Rendering Ready");
+      const rendering = getFirst("Rendering");
+      const graphicsInit = getFirst("Graphics Init");
+
+      if (overall) add(overall, 0);
+      if (pageRequest) add(pageRequest, 0);
+      if (renderingReady) add(renderingReady, 0);
+      if (rendering) add(rendering, 0);
+      if (graphicsInit) add(graphicsInit, 0);
+
+      for (const entry of entries) {
+        if (used.has(entry.index)) continue;
+        if (/^O: chunk/.test(entry.name)) {
+          const chunkChildren = entries.filter(
+            e =>
+              !used.has(e.index) &&
+              e.name.startsWith("O: ") &&
+              Math.abs(e.start - entry.start) < 5000 &&
+              e.start >= entry.start &&
+              e.end <= entry.end + 10000
+          );
+          add(entry, 0);
+          addOperatorListProfile(chunkChildren, 1);
+        }
+      }
+      for (const entry of entries) {
+        if (!used.has(entry.index) && /^E: /.test(entry.name)) {
+          add(entry, 0);
+        }
+      }
+      for (const entry of entries) {
+        if (!used.has(entry.index)) {
+          add(entry, 0);
+        }
+      }
+    } else {
+      rows = entries.map(entry => ({ entry, indent: 0 }));
+    }
+
+    const outBuf = [];
+    let longest = 0;
+    const formatName = name => name.replace(/^[EO]: /, "");
+    for (const {
+      entry: { name },
+      indent,
+    } of rows) {
+      longest = Math.max(formatName(name).length + indent * 2, longest);
+    }
+    for (const { entry, indent } of rows) {
+      const label = `${"  ".repeat(indent)}${formatName(entry.name)}`;
+      outBuf.push(`${label.padEnd(longest)} ${formatDuration(entry)}ms\n`);
+    }
+    return outBuf.join("");
   }
 }
 

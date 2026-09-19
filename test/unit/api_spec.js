@@ -5532,10 +5532,17 @@ have written that much by now. So, here’s to squashing bugs.`);
 
       expect(stats).toBeInstanceOf(StatTimer);
       expect(stats.times.length).toEqual(1);
+      expect(stats instanceof StatTimer).toEqual(true);
+      expect(stats.times.length).toBeGreaterThanOrEqual(3);
 
-      const [statEntry] = stats.times;
+      const [statEntry] = stats.times.filter(
+        time => time.name === "Page Request"
+      );
       expect(statEntry.name).toEqual("Page Request");
       expect(statEntry.end - statEntry.start).toBeGreaterThanOrEqual(0);
+      expect(
+        stats.times.some(time => time.name.startsWith("O: chunk wait"))
+      ).toEqual(true);
 
       await loadingTask.destroy();
     });
@@ -5566,16 +5573,39 @@ have written that much by now. So, here’s to squashing bugs.`);
       const { stats } = pdfPage;
       expect(stats).toBeInstanceOf(StatTimer);
       expect(stats.times.length).toEqual(3);
+      expect(stats instanceof StatTimer).toEqual(true);
+      expect(stats.times.length).toBeGreaterThan(3);
 
-      const [statEntryOne, statEntryTwo, statEntryThree] = stats.times;
+      const [statEntryOne] = stats.times.filter(
+        time => time.name === "Page Request"
+      );
       expect(statEntryOne.name).toEqual("Page Request");
       expect(statEntryOne.end - statEntryOne.start).toBeGreaterThanOrEqual(0);
 
+      const [renderingReadyEntry] = stats.times.filter(
+        time => time.name === "Rendering Ready"
+      );
+      expect(
+        renderingReadyEntry.end - renderingReadyEntry.start
+      ).toBeGreaterThanOrEqual(0);
+
+      const [statEntryTwo] = stats.times.filter(
+        time => time.name === "Rendering"
+      );
       expect(statEntryTwo.name).toEqual("Rendering");
       expect(statEntryTwo.end - statEntryTwo.start).toBeGreaterThan(0);
 
+      const [statEntryThree] = stats.times.filter(
+        time => time.name === "Overall"
+      );
       expect(statEntryThree.name).toEqual("Overall");
       expect(statEntryThree.end - statEntryThree.start).toBeGreaterThan(0);
+      expect(stats.times.some(time => time.name === "Graphics Init")).toEqual(
+        true
+      );
+      expect(
+        stats.times.some(time => time.name.startsWith("E: slice"))
+      ).toEqual(true);
 
       canvasFactory.destroy(canvasAndCtx);
       await loadingTask.destroy();
@@ -5607,6 +5637,7 @@ have written that much by now. So, here’s to squashing bugs.`);
         expect(reason).toBeInstanceOf(RenderingCancelledException);
         expect(reason.message).toEqual("Rendering cancelled, page 1");
         expect(reason.extraDelay).toEqual(0);
+        expect(reason.abortOperatorList).toEqual(false);
       }
 
       canvasFactory.destroy(canvasAndCtx);

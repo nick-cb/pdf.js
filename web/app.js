@@ -1416,6 +1416,7 @@ const PDFViewerApplication = {
       ...apiParams,
       ...args,
     });
+    console.log({ apiParams });
     this.pdfLoadingTask = loadingTask;
 
     loadingTask.onPassword = (updateCallback, reason) => {

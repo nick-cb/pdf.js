@@ -14,6 +14,7 @@
  */
 
 import { PDFPageViewBuffer } from "../../web/pdf_viewer.js";
+import { RenderingStates } from "../../web/renderable_view.js";
 
 describe("PDFViewer", function () {
   describe("PDFPageViewBuffer", function () {
@@ -157,6 +158,42 @@ describe("PDFViewer", function () {
       }
       expect(buffer.has(viewsMap.get(1))).toBeTrue();
       expect(buffer.has(viewsMap.get(2))).toBeFalse();
+    });
+
+    it("cancels unfinished renders outside of the priority range", function () {
+      const buffer = new PDFPageViewBuffer(5);
+      const cancelled = [];
+
+      for (let id = 1; id <= 5; id++) {
+        let renderingState = RenderingStates.RUNNING;
+        if (id === 1) {
+          renderingState = RenderingStates.FINISHED;
+        } else if (id === 2) {
+          renderingState = RenderingStates.PAUSED;
+        }
+        buffer.push({
+          id,
+          renderingState,
+          cancelRendering(options) {
+            cancelled.push({ id, options });
+          },
+          destroy() {},
+        });
+      }
+
+      buffer.cancelRenderingOutsideRange(3, 4);
+
+      expect(cancelled).toEqual([
+        { id: 2, options: { abortOperatorList: true } },
+        { id: 5, options: { abortOperatorList: true } },
+      ]);
+      expect([...buffer].map(view => view.renderingState)).toEqual([
+        RenderingStates.FINISHED,
+        RenderingStates.INITIAL,
+        RenderingStates.RUNNING,
+        RenderingStates.RUNNING,
+        RenderingStates.INITIAL,
+      ]);
     });
   });
 });

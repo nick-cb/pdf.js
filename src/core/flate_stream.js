@@ -151,11 +151,24 @@ class FlateStream extends DecodeStream {
     this.codeBuf = 0;
   }
 
-  async getImageData(length, _decoderOptions) {
+  async getImageData(length, decoderOptions) {
+    const start =
+      typeof performance !== "undefined" ? performance.now() : Date.now();
     const data = await this.asyncGetBytes();
     if (!data) {
-      return this.getBytes(length);
+      const decoded = this.getBytes(length);
+      decoderOptions?.profile?.(
+        "decoder: Flate / JavaScript fallback",
+        start,
+        typeof performance !== "undefined" ? performance.now() : Date.now()
+      );
+      return decoded;
     }
+    decoderOptions?.profile?.(
+      "decoder: Flate / DecompressionStream",
+      start,
+      typeof performance !== "undefined" ? performance.now() : Date.now()
+    );
     if (data.length <= length) {
       return data;
     }

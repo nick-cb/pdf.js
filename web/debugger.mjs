@@ -720,6 +720,16 @@ class PDFBug {
 
   static #activePanel = null;
 
+  static #resizePanel(clientX) {
+    const width = Math.round(window.innerWidth - clientX);
+    const minWidth = 250;
+    const maxWidth = Math.round(window.innerWidth * 0.8);
+    document.documentElement.style.setProperty(
+      "--panel-width",
+      `${Math.min(Math.max(width, minWidth), maxWidth)}px`
+    );
+  }
+
   static tools = [FontInspector, StepperManager, Stats];
 
   static enable(ids) {
@@ -756,6 +766,52 @@ class PDFBug {
      */
     const ui = document.createElement("div");
     ui.id = "PDFBug";
+
+    const resizeHandle = document.createElement("div");
+    resizeHandle.className = "resizeHandle";
+    resizeHandle.tabIndex = 0;
+    resizeHandle.setAttribute("role", "separator");
+    resizeHandle.setAttribute("aria-orientation", "vertical");
+    resizeHandle.setAttribute("aria-label", "Resize debugger panel");
+    resizeHandle.addEventListener("pointerdown", event => {
+      if (event.button !== 0) {
+        return;
+      }
+      event.preventDefault();
+      resizeHandle.setPointerCapture(event.pointerId);
+      ui.classList.add("resizing");
+    });
+    resizeHandle.addEventListener("pointermove", event => {
+      if (!resizeHandle.hasPointerCapture(event.pointerId)) {
+        return;
+      }
+      this.#resizePanel(event.clientX);
+    });
+    const stopResize = event => {
+      if (resizeHandle.hasPointerCapture(event.pointerId)) {
+        resizeHandle.releasePointerCapture(event.pointerId);
+      }
+      ui.classList.remove("resizing");
+    };
+    resizeHandle.addEventListener("pointerup", stopResize);
+    resizeHandle.addEventListener("pointercancel", stopResize);
+    resizeHandle.addEventListener("keydown", event => {
+      let delta = 0;
+      switch (event.key) {
+        case "ArrowLeft":
+          delta = 20;
+          break;
+        case "ArrowRight":
+          delta = -20;
+          break;
+        default:
+          return;
+      }
+      event.preventDefault();
+      const currentX = window.innerWidth - ui.getBoundingClientRect().width;
+      this.#resizePanel(currentX - delta);
+    });
+    ui.append(resizeHandle);
 
     const controls = document.createElement("div");
     controls.setAttribute("class", "controls");

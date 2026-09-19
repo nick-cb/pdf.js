@@ -856,7 +856,7 @@ const defaultOptions = new Map([
     "pdfBug",
     {
       /** @type {boolean} */
-      value: false,
+      value: true,
       kind: OptionKind.API,
     },
   ],

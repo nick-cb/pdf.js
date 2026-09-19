@@ -44,11 +44,24 @@ class BrotliStream extends DecodeStream {
     this.eof = true;
   }
 
-  async getImageData(length, _decoderOptions) {
+  async getImageData(length, decoderOptions) {
+    const start =
+      typeof performance !== "undefined" ? performance.now() : Date.now();
     const data = await this.asyncGetBytes();
     if (!data) {
-      return this.getBytes(length);
+      const decoded = this.getBytes(length);
+      decoderOptions?.profile?.(
+        "decoder: Brotli / JavaScript fallback",
+        start,
+        typeof performance !== "undefined" ? performance.now() : Date.now()
+      );
+      return decoded;
     }
+    decoderOptions?.profile?.(
+      "decoder: Brotli / DecompressionStream",
+      start,
+      typeof performance !== "undefined" ? performance.now() : Date.now()
+    );
     if (data.length <= length) {
       return data;
     }

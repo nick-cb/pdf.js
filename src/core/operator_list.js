@@ -669,6 +669,8 @@ class OperatorList {
     this.dependencies = new Set();
     this.weight = 0;
     this._resolved = streamSink ? null : Promise.resolve();
+    this._profile = [];
+    this._profileIndex = 0;
   }
 
   static setOptions({ isOffscreenCanvasSupported }) {
@@ -724,6 +726,17 @@ class OperatorList {
     }
     this.dependencies.add(dependency);
     this.addOp(OPS.dependency, [dependency]);
+  }
+
+  addProfile(
+    name,
+    start,
+    end = typeof performance !== "undefined" ? performance.now() : Date.now()
+  ) {
+    if (!this._streamSink) {
+      return;
+    }
+    this._profile.push({ name, start, end });
   }
 
   addDependencies(dependencies) {
@@ -801,10 +814,12 @@ class OperatorList {
         lastChunk,
         separateAnnots,
         length: this.length,
+        profile: this._profile.slice(this._profileIndex),
       },
       1,
       this._transfers
     );
+    this._profileIndex = this._profile.length;
 
     this.dependencies.clear();
     this.fnArray.length = 0;
